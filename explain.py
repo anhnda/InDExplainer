@@ -87,7 +87,7 @@ def main():
                     help="target class index; default = model top-1")
     ap.add_argument("--methods", nargs="+", default=list(METHODS),
                     choices=list(METHODS))
-    ap.add_argument("--sigma", type=float, default=11.0)
+    ap.add_argument("--sigma", type=float, default=100.0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--stochastic", action="store_true",
                     help="use Bernoulli-sampled masks in the sufficiency method")
