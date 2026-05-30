@@ -55,6 +55,7 @@ from xai_suff.explainers import (
     PyramidExplainer,   
     blur_reference,
 )
+from regional_eval import score_insertion_deletion
 
 METHODS = {
     "lime": LIMEExplainer,
@@ -150,9 +151,15 @@ def _plot_curves(curves_by_method: dict, out_path: str, title: str):
                    label=f"{name} (AUC={c['insertion_auc']:.3f})")
         ax[1].plot(f, c["deletion"],
                    label=f"{name} (AUC={c['deletion_auc']:.3f})")
-    ax[0].set_title("Insertion (blur -> sharp, top-down)")
+
+    # All methods share the same grid, so read the unit from any one curve.
+    c0 = next(iter(curves_by_method.values()))
+    unit = (f"cells, {c0['cell_frac']:.0%}/cell, n={c0['n_cells']}"
+            if c0.get("regional") else "pixels")
+
+    ax[0].set_title(f"Insertion (blur -> sharp, {unit})")
     ax[0].set_xlabel("fraction inserted"); ax[0].set_ylabel("target prob")
-    ax[1].set_title("Deletion (sharp -> blur, top-down)")
+    ax[1].set_title(f"Deletion (sharp -> blur, {unit})")
     ax[1].set_xlabel("fraction deleted"); ax[1].set_ylabel("target prob")
     for a in ax:
         a.set_ylim(-0.02, 1.02); a.grid(alpha=0.3); a.legend(fontsize=8)
@@ -160,7 +167,6 @@ def _plot_curves(curves_by_method: dict, out_path: str, title: str):
     fig.tight_layout()
     fig.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.close(fig)
-
 
 # --------------------------------------------------------------------------- #
 # runners
@@ -182,8 +188,12 @@ def run_curves(args, model, x, target, class_names, device):
                               args.sigma, args.stochastic)
         print(f"[eval] curves: running {name} ...")
         res = exp.explain(x)
-        c = insertion_deletion(model, x, res.attribution, target, b,
-                               steps=args.steps)
+        c = score_insertion_deletion(
+        model, x, res.attribution, target, b,
+        regional=args.regional,
+        cell_frac=args.cell_frac,
+        steps=args.steps,
+        )
         curves[name] = c
         print(f"[eval]   {name}: ins-AUC={c['insertion_auc']:.3f} "
               f"del-AUC={c['deletion_auc']:.3f}")
@@ -267,6 +277,13 @@ def main():
                     help="insertion/deletion curve resolution")
     ap.add_argument("--stochastic", action="store_true")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # Regional scoring is ON by default; --per-pixel restores RISE ordering.
+    ap.add_argument("--per-pixel", dest="regional", action="store_false",
+                    help="use per-pixel RISE ordering instead of regional cells")
+    ap.set_defaults(regional=True)
+    ap.add_argument("--cell-frac", type=float, default=0.05,
+                    help="fraction of total features per regional cell "
+                        "(default 0.05 = 5%%)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
