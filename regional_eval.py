@@ -89,6 +89,34 @@ def _cell_scores(attr: np.ndarray, cell_id: np.ndarray, n_cells: int) -> np.ndar
 
 
 # --------------------------------------------------------------------------- #
+# removal reference fields (the operator that "deletes" a region)
+# --------------------------------------------------------------------------- #
+def _removal_field(x: torch.Tensor, b: torch.Tensor, del_fill: str) -> torch.Tensor:
+    """Return the field that replaces a deleted region, shape (1,C,H,W).
+
+    del_fill="blur" -> the SAME blur reference b that Phi uses. This makes the
+        deletion metric share its removal operator with the attribution method
+        (pyramid's Phi), so a pyramid advantage here is partly CIRCULAR.
+
+    del_fill="mean" -> a flat per-channel-mean field (each pixel set to the
+        image's channel mean). This is INDEPENDENT of Phi: it does not use the
+        blur operator at all, so a pyramid advantage under mean-fill is
+        non-circular evidence of faithfulness (method note section 7).
+
+    Insertion reveals the true sharp x against this same field as background, so
+    the insertion and deletion curves stay exact inverses; del_fill swaps that
+    shared background (blur vs mean) for both.
+    """
+    if del_fill == "blur":
+        return b
+    if del_fill == "mean":
+        # per-channel spatial mean, broadcast to a constant field
+        mean_c = x.mean(dim=(2, 3), keepdim=True)        # (1,C,1,1)
+        return mean_c.expand_as(x).contiguous()          # (1,C,H,W)
+    raise ValueError(f"unknown del_fill={del_fill!r}; use 'blur' or 'mean'")
+
+
+# --------------------------------------------------------------------------- #
 # regional insertion / deletion
 # --------------------------------------------------------------------------- #
 @torch.no_grad()
@@ -99,6 +127,7 @@ def regional_insertion_deletion(
     target: int,
     b: torch.Tensor,
     cell_frac: float = 0.05,
+    del_fill: str = "blur",       # deletion removal operator: "blur" (=Phi) or "mean"
     batch: int = 16,
 ):
     """Regional insertion/deletion curves: reveal/remove WHOLE CELLS in order.
@@ -122,7 +151,10 @@ def regional_insertion_deletion(
     cell_id_t = torch.as_tensor(cell_id.reshape(-1), device=device)
 
     x_flat = x.view(C, n)
-    b_flat = b.view(C, n)
+    # removal field for DELETION (insertion always reveals the true sharp x).
+    # blur -> shares Phi's operator (circular); mean -> independent of Phi.
+    r = _removal_field(x, b, del_fill)
+    r_flat = r.reshape(C, n)
 
     # Precompute a boolean pixel-mask for "top-k cells" cumulatively.
     # fractions[k] = k cells revealed (k = 0..n_cells), so a curve of n_cells+1
@@ -152,11 +184,13 @@ def regional_insertion_deletion(
     ins_probs = np.zeros(len(keep_masks))
     del_probs = np.zeros(len(keep_masks))
 
-    # insertion: base=blur, fill=sharp (reveal top cells)
-    # deletion : base=sharp, fill=blur (remove top cells)
+    # insertion: base=removal field, fill=sharp (reveal top cells from "removed")
+    # deletion : base=sharp, fill=removal field (remove top cells)
+    # Using the SAME removal field r for both keeps insertion the exact inverse
+    # of deletion (insertion@0 == deletion@full == fully-removed image).
     for base, fill, out in (
-        (b_flat, x_flat, ins_probs),
-        (x_flat, b_flat, del_probs),
+        (r_flat, x_flat, ins_probs),
+        (x_flat, r_flat, del_probs),
     ):
         for start in range(0, len(keep_masks), batch):
             subset = keep_masks[start:start + batch]
@@ -178,6 +212,7 @@ def regional_insertion_deletion(
         "n_cells": int(n_cells),
         "cell_frac": float(cell_frac),
         "cell_side": int(round(np.sqrt(cell_frac * H * W))),
+        "del_fill": del_fill,
     }
 
 
@@ -193,6 +228,7 @@ def score_insertion_deletion(
     b: torch.Tensor,
     regional: bool = True,        # REGIONAL BY DEFAULT
     cell_frac: float = 0.05,      # 5% of features per cell BY DEFAULT
+    del_fill: str = "blur",       # deletion removal operator: "blur" (=Phi) or "mean"
     steps: int = 50,              # used only in per-pixel mode
     batch: int = 16,
 ):
@@ -200,10 +236,15 @@ def score_insertion_deletion(
 
     regional=True  -> reveal/remove whole cells of `cell_frac` features each.
     regional=False -> per-pixel RISE ordering (the original behaviour).
+
+    del_fill controls the DELETION removal operator:
+      "blur" -> remove-by-blur, the same operator pyramid's Phi uses (circular).
+      "mean" -> remove-to-channel-mean, independent of Phi (non-circular check).
     """
     if regional:
         return regional_insertion_deletion(
-            model, x, attr, target, b, cell_frac=cell_frac, batch=batch
+            model, x, attr, target, b,
+            cell_frac=cell_frac, del_fill=del_fill, batch=batch,
         )
     # ---- per-pixel fallback (original evaluate.py logic) ------------------ #
     device = x.device
@@ -213,7 +254,8 @@ def score_insertion_deletion(
     fractions = np.linspace(0, 1, steps + 1)
     counts = (fractions * n).astype(int)
     x_flat = x.view(C, n)
-    b_flat = b.view(C, n)
+    r = _removal_field(x, b, del_fill)
+    r_flat = r.reshape(C, n)
 
     def _build(keep_idx_lists, base_flat, fill_flat):
         imgs = []
@@ -228,8 +270,8 @@ def score_insertion_deletion(
     ins_probs = np.zeros(len(counts))
     del_probs = np.zeros(len(counts))
     for base, fill, out in (
-        (b_flat, x_flat, ins_probs),
-        (x_flat, b_flat, del_probs),
+        (r_flat, x_flat, ins_probs),
+        (x_flat, r_flat, del_probs),
     ):
         for start in range(0, len(counts), batch):
             chunk = counts[start:start + batch]
@@ -246,4 +288,5 @@ def score_insertion_deletion(
         "insertion_auc": float(_trapz(ins_probs, fractions)),
         "deletion_auc": float(_trapz(del_probs, fractions)),
         "regional": False,
+        "del_fill": del_fill,
     }
