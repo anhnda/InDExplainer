@@ -31,6 +31,7 @@ from xai_suff.explainers import (
     IGExplainer,
     LIMEExplainer,
     SufficiencyExplainer,
+    PyramidExplainer,
     blur_reference,
 )
 
@@ -38,6 +39,7 @@ METHODS = {
     "lime": LIMEExplainer,
     "ig": IGExplainer,
     "sufficiency": SufficiencyExplainer,
+    "pyramid": PyramidExplainer,
 }
 
 
