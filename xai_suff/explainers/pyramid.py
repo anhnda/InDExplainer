@@ -87,7 +87,7 @@ class PyramidExplainer(Explainer):
         self,
         *args,
         sigma: float = 11.0,        # blur strength for Phi complement (on-manifold)
-        n_segments: int = 256,       # target number of leaf superpixels (SLIC)
+        n_segments: int = 144,       # target number of leaf superpixels (SLIC)
         compactness: float = 2,  # SLIC compactness
         max_nodes: Optional[int] = None,  # cap on internal-node value queries
         **kw,

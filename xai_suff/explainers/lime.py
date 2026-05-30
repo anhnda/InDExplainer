@@ -19,7 +19,7 @@ from .base import AttributionResult, Explainer, blur_reference
 class LIMEExplainer(Explainer):
     name = "lime"
 
-    def __init__(self, *args, grid=(16, 16), n_samples=1000, sigma=11.0,
+    def __init__(self, *args, grid=(12, 12), n_samples=1000, sigma=11.0,
                  kernel_width=0.25, seed=0, batch_size=64, **kw):
         super().__init__(*args, **kw)
         self.grid = grid
