@@ -63,7 +63,7 @@ def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return x
 
 
-def blur_reference(x_norm: torch.Tensor, sigma: float = 11.0) -> torch.Tensor:
+def blur_reference(x_norm: torch.Tensor, sigma: float = 100.0) -> torch.Tensor:
     """Strong-blur self-reference of a *normalized* image.
 
     Blurs in [0,1] pixel space (so color statistics stay physical) then
