@@ -190,9 +190,8 @@ def run_curves(args, model, x, target, class_names, device):
         res = exp.explain(x)
         c = score_insertion_deletion(
         model, x, res.attribution, target, b,
-        regional=args.regional,
-        cell_frac=args.cell_frac,
-        steps=args.steps,
+        regional=args.regional, cell_frac=args.cell_frac,
+        del_fill=args.del_fill, steps=args.steps,
         )
         curves[name] = c
         print(f"[eval]   {name}: ins-AUC={c['insertion_auc']:.3f} "
@@ -284,6 +283,9 @@ def main():
     ap.add_argument("--cell-frac", type=float, default=0.05,
                     help="fraction of total features per regional cell "
                         "(default 0.05 = 5%%)")
+    ap.add_argument("--del-fill", choices=["blur", "mean"], default="blur",
+                help="deletion removal operator: blur (=Phi, circular) or mean (independent)")
+
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
