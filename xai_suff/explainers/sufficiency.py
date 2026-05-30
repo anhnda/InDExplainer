@@ -1,25 +1,37 @@
-"""In-distribution minimal-sufficient-region attribution (the proposed method).
+"""In-distribution minimal-sufficient-region attribution (binary-mask version).
 
-Solve, per instance, for the smallest feathered sharp region whose composite
+Solve, per instance, for the smallest BINARY sharp region whose composite
 against a blurred self-reference keeps the target probability near f(x):
 
     min_m  |m|_1 + lambda * TV(m)   s.t.  f(Phi(x,m)) >= (1-eps) f(x)
-    Phi(x,m) = m * x + (1-m) * blur_sigma(x)
+    Phi(x,m) = m * x + (1-m) * blur_sigma(x),   m in {0,1}
 
 solved by a Lagrangian with dual ascent on mu >= 0:
 
     L(m,mu) = |m|_1 + lambda*TV(m) + mu * (target_gap - drop_recovered)
 
-Two design choices from the design discussion are built in:
-  * f(b)-relative constraint: "drop" is measured as recovery of the gap from the
-    blur floor f(b) up to f(x), not implicitly relative to zero. We log f(b) so
-    blur neutrality is auditable rather than assumed.
-  * feathered mask: m is a smoothed sigmoid of free logits (Gaussian-blurred
-    pre-activation) so edges are soft -> no boundary/shape leak.
+KEY CHANGE vs. the soft version
+-------------------------------
+The mask is BINARY in the forward pass. Each pixel is either fully sharp
+(m=1, original x) or fully replaced by the blur reference (m=0, b). There is
+NO soft blend and NO feather floor, so a pixel can no longer "leak" a dimmed
+copy of itself through a fractional mask value. This makes localization
+mandatory: a mask that sits on the background reveals background sharp, blurs
+the object away, and f collapses -- the optimizer can no longer cheat by
+dimming the whole image.
 
-Output is a continuous per-pixel sufficiency map in [0,1]. Optional stochastic
-masking (Bernoulli sampling of the soft mask) defends against brittle/adversarial
-masks by constraining the *expected* recovery.
+The mask is non-differentiable, so we use a straight-through estimator:
+forward uses hard (m>0.5); backward uses the smooth sigmoid gradient. A
+temperature `tau` sharpens the sigmoid so the soft proxy tracks the hard
+decision. L1 (budget) and TV (coherence) regularize the SOFT logits to keep
+gradients informative.
+
+Pair this with an ON-MANIFOLD blur reference (sigma ~ 11), so that "removing"
+a pixel replaces it with wombat-colored blur (destroying evidence) rather than
+darkening it. Binary mask + on-manifold b together close both leak paths.
+
+f(b)-relative constraint is kept: recovery is measured from the blur floor
+f(b) up to f(x), and f(b) is logged so blur neutrality is audited.
 """
 from __future__ import annotations
 
@@ -36,16 +48,18 @@ class SufficiencyExplainer(Explainer):
     def __init__(
         self,
         *args,
-        sigma=11.0,           # blur strength for the reference field
+        sigma=11.0,           # blur strength for the reference field (keep on-manifold)
         lam=0.05,             # TV weight
         eps=0.10,             # tolerance: keep >= (1-eps) of the recoverable gap
         steps=300,            # optimization steps
         lr=0.05,              # mask learning rate
         rho=0.5,              # dual ascent rate
-        feather=10.0,          # gaussian sigma for feathering the mask logits
+        tau=0.5,              # sigmoid temperature for the straight-through proxy
+        logit_smooth=0.0,     # optional gaussian smoothing of logits (coherence prior;
+                              # 0 = off. NOT a feather floor -- mask is still binary)
         mu_init=5.0,
         mu_max=50.0,          # clamp dual to avoid runaway
-        stochastic=False,     # sample Bernoulli hard masks for the constraint
+        stochastic=False,     # expected recovery over sampled binary masks
         n_mc=4,               # MC samples when stochastic
         seed=0,
         **kw,
@@ -57,18 +71,51 @@ class SufficiencyExplainer(Explainer):
         self.steps = steps
         self.lr = lr
         self.rho = rho
-        self.feather = feather
+        self.tau = tau
+        self.logit_smooth = logit_smooth
         self.mu_init = mu_init
         self.mu_max = mu_max
         self.stochastic = stochastic
         self.n_mc = n_mc
         self.seed = seed
 
-    def _feathered_mask(self, logits):
-        """Soft mask in [0,1]: blur the logits then sigmoid -> smooth edges."""
-        if self.feather > 0:
-            logits = gaussian_blur(logits, self.feather)
-        return torch.sigmoid(logits)
+    # ------------------------------------------------------------------ #
+    # mask
+    # ------------------------------------------------------------------ #
+    def _binary_mask(self, logits):
+        """Hard {0,1} mask in the forward pass, soft gradient in the backward pass.
+
+        Returns (m_hard, m_soft):
+          m_hard -- straight-through binary mask used in the composite (forward
+                    value is exactly 0 or 1; gradient flows through m_soft).
+          m_soft -- smooth sigmoid proxy, used for the L1 / TV regularizers so
+                    they stay differentiable and informative.
+        """
+        z = logits
+        if self.logit_smooth > 0:
+            # optional coherence prior on the logits -- this smooths the *decision
+            # boundary location*, NOT the mask values; the output is still binary.
+            z = gaussian_blur(z, self.logit_smooth)
+        m_soft = torch.sigmoid(z / self.tau)
+        m_hard = (m_soft > 0.5).float()
+        # straight-through: binary forward, sigmoid-gradient backward
+        m_st = m_hard + (m_soft - m_soft.detach())
+        return m_st, m_soft
+
+    def _stochastic_binary_mask(self, logits):
+        """Bernoulli-sampled binary mask with straight-through gradient.
+
+        Each pixel is independently kept with probability sigmoid(z/tau). Used
+        when stochastic=True to constrain the EXPECTED recovery over sampled
+        binary masks (a stronger defense against brittle single masks).
+        """
+        z = logits
+        if self.logit_smooth > 0:
+            z = gaussian_blur(z, self.logit_smooth)
+        m_soft = torch.sigmoid(z / self.tau)
+        hard = torch.bernoulli(m_soft.detach())
+        m_st = hard + (m_soft - m_soft.detach())
+        return m_st, m_soft
 
     @staticmethod
     def _tv(m):
@@ -79,6 +126,9 @@ class SufficiencyExplainer(Explainer):
     def _target_prob(self, comp, target):
         return F.softmax(self.model(comp), dim=1)[:, target]
 
+    # ------------------------------------------------------------------ #
+    # explain
+    # ------------------------------------------------------------------ #
     def explain(self, x: torch.Tensor) -> AttributionResult:
         x = x.to(self.device)
         target = self._resolve_target(x)
@@ -87,13 +137,12 @@ class SufficiencyExplainer(Explainer):
         with torch.no_grad():
             f_x = float(self._target_prob(x, target).item())
             f_b = float(self._target_prob(b, target).item())
-        # recoverable gap: how much probability the sharp evidence can add over blur
         gap = max(f_x - f_b, 1e-6)
-        target_recovery = (1.0 - self.eps) * gap  # must recover at least this much
+        target_recovery = (1.0 - self.eps) * gap
 
-        # free logits parameterizing the mask (start mildly positive ~ mostly on)
         torch.manual_seed(self.seed)
-        logits = torch.zeros_like(x[:, :1, :, :]).requires_grad_(True)  # (1,1,H,W)
+        # start slightly positive so the mask begins mostly "on", then shrinks
+        logits = torch.full_like(x[:, :1, :, :], 0.5).requires_grad_(True)  # (1,1,H,W)
         opt = torch.optim.Adam([logits], lr=self.lr)
         mu = self.mu_init
 
@@ -101,32 +150,34 @@ class SufficiencyExplainer(Explainer):
 
         for step in range(self.steps):
             opt.zero_grad()
-            m = self._feathered_mask(logits)  # (1,1,H,W) in [0,1]
 
             if self.stochastic:
-                # expected recovery over Bernoulli-sampled hard masks
+                # expected recovery over Bernoulli-sampled BINARY masks
                 rec = 0.0
+                m_soft_acc = None
                 for _ in range(self.n_mc):
-                    hard = torch.bernoulli(m.detach())
-                    # straight-through: use soft m for gradient, hard for forward effect
-                    m_st = hard + (m - m.detach())
+                    m_st, m_soft = self._stochastic_binary_mask(logits)
                     comp = m_st * x + (1 - m_st) * b
                     rec = rec + (self._target_prob(comp, target) - f_b)
+                    m_soft_acc = m_soft if m_soft_acc is None else m_soft_acc
                 recovery = rec / self.n_mc
+                m_for_reg = m_soft_acc            # regularize the soft proxy
             else:
-                comp = m * x + (1 - m) * b
-                recovery = self._target_prob(comp, target) - f_b  # (1,)
+                m_st, m_soft = self._binary_mask(logits)
+                comp = m_st * x + (1 - m_st) * b  # BINARY composite: sharp OR blur
+                recovery = self._target_prob(comp, target) - f_b
+                m_for_reg = m_soft
 
-            mass = m.mean()
-            tv = self._tv(m)
-            # constraint violation: positive when we haven't recovered enough
-            violation = target_recovery - recovery  # scalar tensor
+            # budget (L1) and coherence (TV) on the soft proxy -> differentiable
+            mass = m_for_reg.mean()
+            tv = self._tv(m_for_reg)
+
+            violation = target_recovery - recovery  # >0 when under-recovered
             loss = mass + self.lam * tv + mu * violation.mean()
 
             loss.backward()
             opt.step()
 
-            # dual ascent on mu (clamped)
             with torch.no_grad():
                 mu = float(np.clip(mu + self.rho * float(violation.mean().item()),
                                    0.0, self.mu_max))
@@ -136,11 +187,13 @@ class SufficiencyExplainer(Explainer):
             history["recovery"].append(float(recovery.mean().item()))
             history["mu"].append(mu)
 
+        # final evaluation uses the HARD binary mask -- f_phi is now honest:
+        # it is the probability recovered by revealing ONLY the kept pixels.
         with torch.no_grad():
-            m_final = self._feathered_mask(logits)
-            comp = m_final * x + (1 - m_final) * b
+            m_hard, _ = self._binary_mask(logits)
+            comp = m_hard * x + (1 - m_hard) * b
             f_phi = float(self._target_prob(comp, target).item())
-            attr = m_final.squeeze().cpu().numpy()  # (H,W)
+            attr = m_hard.squeeze().cpu().numpy()  # (H,W) in {0,1}
 
         return AttributionResult(
             attribution=attr,
@@ -156,6 +209,8 @@ class SufficiencyExplainer(Explainer):
                 "final_mass": float(attr.mean()),
                 "mu_final": mu,
                 "stochastic": self.stochastic,
+                "binary": True,
+                "tau": self.tau,
                 "history": history,
             },
         )
