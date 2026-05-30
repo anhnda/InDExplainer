@@ -42,7 +42,7 @@ class SufficiencyExplainer(Explainer):
         steps=300,            # optimization steps
         lr=0.05,              # mask learning rate
         rho=0.5,              # dual ascent rate
-        feather=2.0,          # gaussian sigma for feathering the mask logits
+        feather=10.0,          # gaussian sigma for feathering the mask logits
         mu_init=5.0,
         mu_max=50.0,          # clamp dual to avoid runaway
         stochastic=False,     # sample Bernoulli hard masks for the constraint
