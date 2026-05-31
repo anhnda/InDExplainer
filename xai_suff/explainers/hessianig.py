@@ -104,7 +104,7 @@ class HessianIGExplainer(Explainer):
         self,
         *args,
         steps: int = 32,          # Riemann steps for the IG path (first order)
-        hess_steps: int = 12,     # steps PER AXIS for the double integral (k=m)
+        hess_steps: int = 8,      # midpoint steps PER AXIS for the double integral
         sigma: float = 11.0,      # blur strength of the reference b (shared Phi)
         k: int = 14,              # grid side; K = k*k cells for the interaction
         batch_size: int = 16,     # batching for the first-order IG path
@@ -178,7 +178,11 @@ class HessianIGExplainer(Explainer):
         X = b + field * delta
         logits = self.model(X)
         self._n_forward += 1
-        score = F.log_softmax(logits, dim=1)[:, target]
+        # Integrate the Hessian of the SAME f used by the reveal matrix and the
+        # completeness RHS: softmax PROBABILITY, not log-softmax. log-softmax has
+        # large, sign-variable second derivatives and integrates to a different
+        # quantity -- it breaks interaction-completeness (sum Gamma vs f(x)-f(b)).
+        score = F.softmax(logits, dim=1)[:, target]
         grads = torch.autograd.grad(score, g, create_graph=True)[0]
         self._n_backward += 1
         return g, grads
@@ -187,16 +191,25 @@ class HessianIGExplainer(Explainer):
     # integrated cell-pair Hessian -- double integral (eq. 25), dispatcher
     # ------------------------------------------------------------------ #
     def _integrated_hessian(self, x, b, target, slices, H, W) -> np.ndarray:
-        """Gamma (K x K) = sum_l sum_p (l/k)(p/m) * H(t=(l/k)(p/m)) * 1/(k m).
+        """Gamma (K x K), Integrated Hessians on the cell grid.
 
+        Off-diagonal (eq. 13):  Gamma_ij = int int a*b * d2f/dg_i dg_j da db.
+        Diagonal (eq. 17): Gamma_ii additionally gets the first-order term
+            int int  df/dg_i  da db
+        so that interaction-completeness sum_ij Gamma_ij = f(x)-f(b) can close.
         Per-cell prefactor (g*-g')=1 by gate construction. fast vs exact differ
-        only in how each per-point Hessian H(t) is formed.
+        only in how each per-point Hessian is formed.
         """
         K = len(slices)
         steps = self.hess_steps
-        # k = m steps per axis; product nodes t = (l/k)(p/m), weight (l/k)(p/m)
-        axis = (torch.arange(1, steps + 1, device=self.device).float()) / steps
+        # Midpoint nodes on BOTH axes: t_node = (l-0.5)/steps. Midpoint converges
+        # O(1/steps^2) vs right-Riemann's O(1/steps), and is exact for the
+        # bilinear weight a*b -- so completeness converges fast and hess_steps can
+        # be small. Product path t=(la)(pb), 2nd-order weight (la)(pb); the
+        # diagonal first-order term has weight 1 under da db.
+        axis = (torch.arange(1, steps + 1, device=self.device).float() - 0.5) / steps
         Gamma = torch.zeros((K, K), dtype=torch.float64, device=self.device)
+        first_order_diag = torch.zeros((K,), dtype=torch.float64, device=self.device)
         norm = 1.0 / (steps * steps)
 
         gen = torch.Generator(device="cpu").manual_seed(self.seed)
@@ -204,14 +217,18 @@ class HessianIGExplainer(Explainer):
         for la in axis:
             for pb in axis:
                 t = float(la * pb)
-                w = float(la * pb)
+                w2 = float(la * pb)              # second-order weight a*b
                 g, grads = self._point_grads(x, b, target, slices, H, W, t)
+                # accumulate diagonal first-order term: int int df/dg_i da db
+                first_order_diag += grads.detach().to(torch.float64) * norm
                 if self.fast:
                     Hmat = self._hvp_hessian(g, grads, K, gen)
                 else:
                     Hmat = self._exact_hessian(g, grads, K)
-                Gamma += w * Hmat * norm
+                Gamma += w2 * Hmat * norm
 
+        # add the first-order term onto the diagonal (eq. 17)
+        Gamma += torch.diag(first_order_diag)
         return Gamma.cpu().numpy()
 
     def _exact_hessian(self, g, grads, K) -> torch.Tensor:
