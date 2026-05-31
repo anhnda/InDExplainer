@@ -93,9 +93,28 @@ def main():
                            del_fill=args.del_fill)
         faith[name] = {"insertion_auc": c["insertion_auc"],
                        "deletion_auc": c["deletion_auc"],
-                       "del_fill": c.get("del_fill")}
+                       "del_fill": c.get("del_fill"),
+                       "map": "additive (leaf v)" if name == "pyramid" else "default"}
         print(f"[cmp]   {name}: ins-AUC={c['insertion_auc']:.3f} "
               f"del-AUC={c['deletion_auc']:.3f}")
+
+    # ---- pyramid scored with the SYNERGY map (Delta-derived ranking) ------ #
+    # This is the "use synergy as the insertion/deletion input" option. It is
+    # LOCKED to mean-fill (non-circular): scoring a Delta-ranking with blur-fill
+    # would reuse pyramid's own Phi as the removal operator and be circular.
+    try:
+        syn_attr = M.synergy_attribution_map(results["pyramid"])
+        cs = M.faithfulness(score_insertion_deletion, model, x, syn_attr,
+                            target, b, cell_frac=args.cell_frac,
+                            del_fill="mean")  # forced non-circular
+        faith["pyramid_synergy"] = {"insertion_auc": cs["insertion_auc"],
+                                    "deletion_auc": cs["deletion_auc"],
+                                    "del_fill": "mean (forced non-circular)",
+                                    "map": "synergy (max|Delta|)"}
+        print(f"[cmp]   pyramid_synergy: ins-AUC={cs['insertion_auc']:.3f} "
+              f"del-AUC={cs['deletion_auc']:.3f}  [Delta-ranked, mean-fill]")
+    except ValueError as e:
+        print(f"[cmp]   pyramid_synergy skipped: {e}")
     with open(os.path.join(args.out, "faithfulness.json"), "w") as fh:
         json.dump(faith, fh, indent=2)
 
@@ -128,6 +147,10 @@ def main():
     for name in methods:
         lines.append(f"  {name:>8} {faith[name]['insertion_auc']:>9.3f} "
                      f"{faith[name]['deletion_auc']:>9.3f}")
+    if "pyramid_synergy" in faith:
+        ps = faith["pyramid_synergy"]
+        lines.append(f"  {'pyr-syn':>8} {ps['insertion_auc']:>9.3f} "
+                     f"{ps['deletion_auc']:>9.3f}   <- Delta-ranked map, mean-fill")
     lines += [
         "",
         "SECOND-ORDER interaction (LIME = zero by construction):",
