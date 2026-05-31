@@ -15,10 +15,10 @@ import sys
 import numpy as np
 
 import torch
-from backbone import load_backbone, get_class_names, load_image, denormalize
+from xai_suff.backbone import load_backbone, get_class_names, load_image, denormalize
 
 # adjust this import to your package layout
-from explainers.pyramidexplainer import PyramidExplainer
+from xai_suff.explainers import PyramidExplainer
 
 from pyramid_interactions import (
     summarize_synergy, check_identity, plot_interactions, delta_localization_map,
