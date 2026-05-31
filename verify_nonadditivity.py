@@ -227,9 +227,10 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
         f"class={target} ({target_name})   "
         f"v(joint)={v_joint:+.4f}   sum v(c)={v_sum:+.4f}   g={g:+.4f}   "
         f"({'COOPERATION (whole>parts)' if g > 0 else 'REDUNDANCY (whole<parts)'})",
-        fontsize=FS_SUPTITLE,
+        fontsize=FS_SUPTITLE, y=1.02,
     )
-    fig.tight_layout()
+    # reserve headroom so the two-line subplot titles clear the suptitle
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
