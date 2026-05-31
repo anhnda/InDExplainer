@@ -63,6 +63,10 @@ def main():
     ap.add_argument("--k", type=int, default=14, help="grid side for pairwise + Hessian")
     ap.add_argument("--hess-steps", type=int, default=16,
                     help="Riemann steps for the integrated Hessian")  # [NEW]
+    ap.add_argument("--exact-hessian", action="store_true",
+                    help="use exact full Hessian (slow); default is fast Hutchinson")  # [NEW]
+    ap.add_argument("--n-probes", type=int, default=16,
+                    help="Hutchinson probes/step in fast mode")  # [NEW]
     ap.add_argument("--verdict-pairs", type=int, default=24,
                     help="random cell pairs for Hessian delta-faithfulness")  # [NEW]
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -88,7 +92,9 @@ def main():
                                     class_names=names, sigma=args.sigma),
         "hessian_ig": HessianIGExplainer(model, target_class=target, device=device,  # [NEW]
                                          class_names=names, sigma=args.sigma,
-                                         k=args.k, hess_steps=args.hess_steps),
+                                         k=args.k, hess_steps=args.hess_steps,
+                                         fast=not args.exact_hessian,
+                                         n_probes=args.n_probes),
     }
 
     # ---- first-order faithfulness (shared grid, non-circular fill) -------- #
@@ -254,9 +260,13 @@ def main():
         "",
         "COST:",
         f"  pyramid forward passes   = {inter['pyramid_query_cost']}",
+        f"  hessian-IG mode          = {hess.extras['mode']}"
+        + (f" (n_probes={hess.extras['n_probes']})" if hess.extras['mode'] == 'fast_hutchinson' else ""),
         f"  hessian-IG forward       = {hess.extras['n_forward']}",
         f"  hessian-IG backward      = {hess.extras['n_backward']} "
-        f"(K backward/step x hess_steps; K={args.k*args.k})",
+        + (f"(n_probes backward/step x hess_steps; K={args.k*args.k})"
+           if hess.extras['mode'] == 'fast_hutchinson'
+           else f"(K backward/step x hess_steps; K={args.k*args.k})"),
     ]
     txt = "\n".join(lines) + "\n"
     with open(os.path.join(args.out, "summary.txt"), "w") as fh:

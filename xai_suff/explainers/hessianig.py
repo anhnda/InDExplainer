@@ -71,6 +71,9 @@ class HessianIGExplainer(Explainer):
         sigma: float = 11.0,      # blur strength of the reference b (shared Phi)
         k: int = 14,              # grid side; K = k*k cells for the interaction
         batch_size: int = 16,     # batching for the first-order IG path
+        fast: bool = True,        # fast (Hutchinson HVP) by default; False = exact
+        n_probes: int = 16,       # # random probes per step in fast mode
+        seed: int = 0,            # RNG seed for the Hutchinson probes
         **kw,
     ):
         super().__init__(*args, **kw)
@@ -79,6 +82,9 @@ class HessianIGExplainer(Explainer):
         self.sigma = sigma
         self.k = k
         self.batch_size = batch_size
+        self.fast = fast
+        self.n_probes = n_probes
+        self.seed = seed
         # bookkeeping for query_cost-style reporting
         self._n_forward = 0
         self._n_backward = 0
@@ -123,45 +129,110 @@ class HessianIGExplainer(Explainer):
         return ig.sum(dim=1).squeeze(0).detach().cpu().numpy()  # (H,W)
 
     # ------------------------------------------------------------------ #
-    # integrated cell-pair Hessian (exact, double autograd)
+    # integrated cell-pair Hessian -- dispatcher
     # ------------------------------------------------------------------ #
     def _integrated_hessian(self, x, b, target, slices, H, W) -> np.ndarray:
-        """Return the K x K integrated-Hessian interaction matrix Phi_{ij}.
+        """Integrated cell-pair Hessian Phi (K x K).
 
         Phi_{ij} = integral_0^1 a * d^2 f(X(a*1)) / dg_i dg_j  da,   g in [0,1]^K.
-        Riemann sum with midpoint-ish nodes over hess_steps; endpoints 0->1.
+
+        fast=False -> exact: full Hessian per step, K backward passes/step.
+        fast=True  -> Hutchinson HVP estimate: n_probes backward passes/step.
+        Both share the same integration nodes and gate construction, so the only
+        difference is how the per-step Hessian is obtained.
+        """
+        if self.fast:
+            return self._integrated_hessian_fast(x, b, target, slices, H, W)
+        return self._integrated_hessian_exact(x, b, target, slices, H, W)
+
+    def _step_grads(self, x, b, target, slices, H, W, a):
+        """Build the per-step gate g, composite X, and first derivatives df/dg.
+
+        Returns (g, grads) with grads carrying create_graph=True so HVPs / rows
+        can be taken downstream. Shared by exact and fast paths.
         """
         K = len(slices)
-        delta = (x - b)  # (1,3,H,W); cell_c contribution is delta restricted there
-        Phi = torch.zeros((K, K), dtype=torch.float64, device=self.device)
+        delta = (x - b)
+        g = torch.full((K,), float(a), device=self.device,
+                       dtype=torch.float32, requires_grad=True)
+        field = self._gate_field(g, slices, H, W)              # (1,1,H,W)
+        X = b + field * delta                                  # composite input
+        logits = self.model(X)
+        self._n_forward += 1
+        score = F.log_softmax(logits, dim=1)[:, target]        # scalar (batch 1)
+        grads = torch.autograd.grad(score, g, create_graph=True)[0]  # (K,)
+        self._n_backward += 1
+        return g, grads
 
+    # ------------------------------------------------------------------ #
+    # exact: full Hessian via double autograd (K backward passes / step)
+    # ------------------------------------------------------------------ #
+    def _integrated_hessian_exact(self, x, b, target, slices, H, W) -> np.ndarray:
+        K = len(slices)
+        Phi = torch.zeros((K, K), dtype=torch.float64, device=self.device)
         alphas = (torch.arange(self.hess_steps, device=self.device) + 0.5) / self.hess_steps
         dα = 1.0 / self.hess_steps
 
         for a in alphas:
-            # gate vector g = a * 1  (all cells partially revealed by fraction a)
-            g = torch.full((K,), float(a), device=self.device, requires_grad=True)
-            field = self._gate_field(g, slices, H, W)         # (1,1,H,W)
-            X = b + field * delta                              # composite input
-            logits = self.model(X)
-            self._n_forward += 1
-            score = F.log_softmax(logits, dim=1)[:, target]    # scalar (batch 1)
-
-            # first derivatives df/dg  (length K), create graph for 2nd order
-            grads = torch.autograd.grad(score, g, create_graph=True)[0]  # (K,)
-            self._n_backward += 1
-
+            g, grads = self._step_grads(x, b, target, slices, H, W, a)
             # full Hessian row by row: d/dg_i (df/dg_j) -> K backward passes
             rows = []
             for i in range(K):
-                row_i = torch.autograd.grad(
-                    grads[i], g, retain_graph=True
-                )[0]  # (K,)
+                row_i = torch.autograd.grad(grads[i], g, retain_graph=True)[0]  # (K,)
                 self._n_backward += 1
                 rows.append(row_i.detach().to(torch.float64))
             Hmat = torch.stack(rows, dim=0)                    # (K,K)
             Hmat = 0.5 * (Hmat + Hmat.t())                     # symmetrize
+            Phi += float(a) * Hmat * dα
 
+        return Phi.cpu().numpy()
+
+    # ------------------------------------------------------------------ #
+    # fast: Hutchinson HVP estimate (n_probes backward passes / step)
+    # ------------------------------------------------------------------ #
+    def _integrated_hessian_fast(self, x, b, target, slices, H, W) -> np.ndarray:
+        """Stochastic-probe estimate of the same integrated Hessian.
+
+        At each step we draw n_probes Rademacher vectors v in {-1,+1}^K and form
+        the Hessian-vector product Hv = d/dg (grad . v) (one backward pass each).
+        The rank-1 outer products average to the Hessian:
+
+            E_v[ (Hv) v^T ] = H            (v Rademacher, E[v v^T] = I)
+
+        so  H_hat = mean_p (H v_p) v_p^T , symmetrized, is an unbiased estimate of
+        the full K x K Hessian using n_probes (<< K) backward passes per step.
+        Bias-free in expectation; variance ~ 1/n_probes on the off-diagonals.
+        Diagonal entries are exact-in-expectation too but noisier; the verdict
+        cares about off-diagonals, which is where Hutchinson is well-behaved.
+
+        Cost/step: 1 (first grad) + n_probes (HVPs) backward passes, vs 1 + K
+        for exact. For k=14 (K=196), n_probes=16 -> ~10x fewer backward passes.
+        """
+        K = len(slices)
+        Phi = torch.zeros((K, K), dtype=torch.float64, device=self.device)
+        alphas = (torch.arange(self.hess_steps, device=self.device) + 0.5) / self.hess_steps
+        dα = 1.0 / self.hess_steps
+
+        gen = torch.Generator(device="cpu").manual_seed(self.seed)
+
+        for a in alphas:
+            g, grads = self._step_grads(x, b, target, slices, H, W, a)
+
+            Hacc = torch.zeros((K, K), dtype=torch.float64, device=self.device)
+            for p in range(self.n_probes):
+                # Rademacher probe (generated on CPU for determinism, moved on)
+                v = (torch.randint(0, 2, (K,), generator=gen, dtype=torch.float32)
+                     * 2 - 1).to(self.device)
+                # HVP: d/dg (grads . v) -- last probe frees the graph
+                retain = p < self.n_probes - 1
+                Hv = torch.autograd.grad(
+                    grads, g, grad_outputs=v, retain_graph=retain
+                )[0]  # (K,)
+                self._n_backward += 1
+                Hacc += torch.outer(Hv.to(torch.float64), v.to(torch.float64))
+
+            Hmat = Hacc / self.n_probes
+            Hmat = 0.5 * (Hmat + Hmat.t())                     # symmetrize
             Phi += float(a) * Hmat * dα
 
         return Phi.cpu().numpy()
@@ -208,6 +279,8 @@ class HessianIGExplainer(Explainer):
                 "n_cells": K,
                 "steps": self.steps,
                 "hess_steps": self.hess_steps,
+                "mode": "fast_hutchinson" if self.fast else "exact",
+                "n_probes": self.n_probes if self.fast else None,
                 "interaction_matrix": I_hess,        # (K,K) integrated Hessian
                 "diag_mass": diag_mass,
                 "off_diag_mass": off_diag_mass,
