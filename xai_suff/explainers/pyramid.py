@@ -1,75 +1,73 @@
-"""PyramidExplainer -- hierarchical, interaction-aware, on-manifold attribution.
+"""PyramidExplainer -- model-aware hierarchical EVIDENCE LOCALIZATION.
 
-Implements the method note (PyramidExplainer.md) against the package contract:
+This is a re-derivation of the method. The previous version built the region
+tree as the greedy MINIMIZER of non-additivity J(T) = sum_R w(R)|Delta(R)|,
+which structurally defers every value-gaining merge upward: the object region
+never forms as a clean node, value only completes at the root, and Delta(root)
+absorbs essentially the whole response ("root takes all"). That objective is
+wrong for the question we actually care about.
 
-    Explainer(model, target_class=None, device=...)
-    explainer.explain(x) -> AttributionResult
+New question
+------------
+    Which SMALL, compact superregion does the model actually rely on, and can
+    we grow it as a single node whose value already equals (almost) the whole
+    response -- so that revealing it occupies the main focus of the object,
+    the remainder from that superregion down to its leaves telescopes cleanly,
+    and the final merge with the (uninformative) background is a near-zero
+    remainder rather than the dominant term?
 
-Core construction
------------------
-1. Segment the image into superpixels (leaves).
-2. Build an agglomerative region tree T as the GREEDY MINIMIZER of an explicit
-   tree objective, NOT as an ad-hoc "merge most-similar pair" loop:
+Construction (value-gain agglomeration)
+---------------------------------------
+On-manifold value of a region R (blur-completion Phi):
 
-       J(T) = sum_{R in I} w(R) * |Delta(R)|,   w(R) = 1 / area(R)
+    Phi_R(x) = reveal R sharp, complement = blur_sigma(x)
+    v(R)     = z_y(Phi_R(x)) - z_y(b)              (logits; b = blurred self-ref)
 
-   Rationale (P1 leaf honesty, P2 localization): every tree is exactly correct
-   (the telescoping identity below holds for ANY partition tree), so the tree
-   cannot change correctness -- it only chooses WHERE on the scale axis the
-   (conserved) non-additivity mass appears. We want fine-scale merges additive
-   (small |Delta|, weighted heavily by 1/area) and synergy concentrated at a few
-   coarse nodes. Minimizing J pushes residual mass upward.
+At each step we merge the adjacent pair whose union gains the most target value
+PER PIXEL ADDED:
 
-   Each merge creates exactly one internal node, so committing (u,v) adds a
-   single term w(u|v)*|Delta(u|v)| to J. The steepest-descent step is therefore
+    gain(u,v) = [ v(u|v) - max(v(u), v(v)) ] / area(u|v)
+    (u*,v*)   = argmax_{(u,v) in adj} gain(u,v)                          (MAXIMIZE)
 
-       (u*,v*) = argmin_{(u,v) in adj} w(u|v) * | v(u|v) - v(u) - v(v) |
+Rationale. Regions that JOINTLY cross the recognition threshold raise v sharply
+and merge early, snapping the object together into a compact high-v node R*.
+Background regions (sky, grass) raise v by ~0 per pixel, so they stay low-v and
+merge last. The object superregion therefore appears as a real INTERNAL node
+with v(R*) ~= v(root); the final root merge (object + background) carries a
+small Delta. This is the opposite of the old minimize-|Delta| direction, and it
+is what "the superregion takes most of the score, not the root" demands.
 
-   This is Ward's method with a MODEL-DEFINED linkage: we merge the adjacent
-   pair of least *explanation non-additivity* increase, evaluating f under Phi
-   rather than comparing colors. The merge rule is the derivative of J, not an
-   independent heuristic.
+Blind proposal, model-aware selection. A pure greedy max would trial v(u|v) for
+every adjacent pair at every level (O(nE) passes). We shortlist the k most
+backbone-feature-similar adjacent pairs (model-BLIND: no target, no v), then
+score only those k by the value-gain criterion. The chosen union value is cached
+and reused as the node value, so only the <= k-1 rejected trials cost extra
+passes => O(n*k).
 
-   We minimize (not maximize) |Delta|: a synergy that survives a tree built to
-   defer it is robust evidence; one found by a tree built to seek it is an
-   artifact. Minimization is what P1/P2 demand and what makes residuals trusted.
+Focal node. After the build we report the FOCAL node R* = the minimal-area node
+with v(R*) >= tau * v(root). Its subtree is the model's evidence; everything
+above it is remainder. (Reported in extras; also drives the per-pixel map.)
 
-   Cost control -- "blind proposal, model-aware selection": a pure greedy would
-   trial v(u|v) for every adjacent pair every level (O(nE) forward passes). We
-   instead shortlist the k most-similar adjacent pairs by a *blind* signal
-   (backbone intermediate-feature distance, falling back to mean color), then
-   score only those k by the model-aware criterion. Chosen-merge values are
-   cached and reused as tree nodes, so only the <= k-1 rejected trials cost
-   extra passes => O(n*k) forward passes, a tunable constant over 2n-1.
+Conservation (preserved, holds for ANY tree)
+--------------------------------------------
+    v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R),   Delta = v(R) - sum v(child)
 
-3. Holistic on-manifold value of any region R (blur-completion Phi):
-
-       Phi_R(x) = reveal R sharp, replace complement R^c with blur_sigma(x)
-       v(R)     = f(Phi_R(x)) - f(x0)            with x0 = full blur reference b
-
-4. Node synergy (whole minus parts) for internal node R with children c_1..c_m:
-
-       Delta(R) = v(R) - sum_j v(c_j)
-
-   Delta>0 cooperation, Delta<0 redundancy.
-
-5. Completeness-style identity (telescoping), preserved because the tree stays a
-   strict binary partition -- only WHICH coalitions are sampled changes:
-
-       v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
+The telescoping identity is independent of the merge rule, so the value-gain
+construction changes only WHICH coalitions are sampled, never the correctness of
+the accounting. The reconstruction residual is reported as a self-check.
 
 Per-pixel attribution
 ----------------------
-The returned (H,W) map is the leaf-additive part: each pixel takes the value of
-its leaf superpixel, v(leaf) / area(leaf). Interaction is reported separately in
-`extras` (the full tree with each node's v and Delta).
+The (H,W) map is the FOCAL-subtree leaf density: leaves under R* take
+v(leaf)/area(leaf); leaves outside R* are zeroed (they are remainder, not
+evidence). This makes the map point at the compact object region. The raw
+leaf-additive density over all leaves is also provided in extras for parity.
 
-Reference dependence (Phi, tree) is stated, not hidden: chosen sigma, segmentation
-params, merge objective settings, and the value-query budget are logged in `extras`.
+Reference dependence (Phi, tree, tau) is logged in extras, not hidden.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -78,17 +76,9 @@ import torch.nn.functional as F
 
 try:  # scikit-image is used for the leaf segmentation
     from skimage.segmentation import slic
-    from skimage.future import graph as skgraph  # region adjacency graph
     _HAS_SKIMAGE = True
-except Exception:  # pragma: no cover - skimage layout varies across versions
-    try:
-        from skimage.segmentation import slic
-        from skimage.graph import rag_mean_color  # newer skimage location
-        _HAS_SKIMAGE = True
-        skgraph = None
-    except Exception:
-        _HAS_SKIMAGE = False
-        skgraph = None
+except Exception:  # pragma: no cover
+    _HAS_SKIMAGE = False
 
 from .base import AttributionResult, Explainer, blur_reference, denormalize
 
@@ -97,10 +87,10 @@ from .base import AttributionResult, Explainer, blur_reference, denormalize
 class _Node:
     """One region in the agglomerative tree."""
     id: int
-    mask: np.ndarray            # (H,W) bool, pixels belonging to this region
-    children: list             # list[_Node]; empty for leaves
-    v: float = 0.0             # holistic on-manifold value f(Phi_R(x)) - f(x0)
-    delta: float = 0.0         # synergy v(R) - sum_j v(child_j); 0 for leaves
+    mask: np.ndarray            # (H,W) bool
+    children: list              # list[_Node]; empty for leaves
+    v: float = 0.0              # holistic on-manifold value z_y(Phi_R) - z_y(b)
+    delta: float = 0.0          # synergy v(R) - sum_j v(child_j); 0 for leaves
 
     @property
     def is_leaf(self) -> bool:
@@ -117,55 +107,55 @@ class PyramidExplainer(Explainer):
     def __init__(
         self,
         *args,
-        sigma: float = 11.0,        # blur strength for Phi complement (on-manifold)
-        n_segments: int = 144,       # target number of leaf superpixels (SLIC)
-        compactness: float = 2,  # SLIC compactness
-        max_nodes: Optional[int] = None,  # (unused now; kept for API compat)
-        # --- merge-objective controls ----------------------------------- #
-        shortlist_k: int = 6,        # blind-proposal shortlist size per merge step
-        feature_layer: str = "layer3",  # backbone layer for blind feature distance
-        merge_mode: str = "value",   # "value" (objective-driven) | "color" (legacy)
-        weight_eps: float = 1.0,     # w(R) = 1 / (area(R) + weight_eps)
+        sigma: float = 11.0,            # blur strength for Phi complement
+        n_segments: int = 144,          # target number of leaf superpixels (SLIC)
+        compactness: float = 2.0,       # SLIC compactness
+        # --- value-gain merge controls ---------------------------------- #
+        shortlist_k: int = 6,           # blind-proposal shortlist size per step
+        feature_layer: str = "layer3",  # backbone layer for blind feature dist
+        merge_mode: str = "focus",      # "focus" (value-gain) | "color" (legacy blind)
+        use_logits: bool = True,        # value in logit space (matches the paper)
+        focal_tau: float = 0.8,         # focal node threshold: v(R*) >= tau*v(root)
+        gain_area_pow: float = 1.0,     # area exponent in the per-pixel denominator
         **kw,
     ):
         super().__init__(*args, **kw)
         self.sigma = sigma
         self.n_segments = n_segments
         self.compactness = compactness
-        self.max_nodes = max_nodes
         self.shortlist_k = shortlist_k
         self.feature_layer = feature_layer
         self.merge_mode = merge_mode
-        self.weight_eps = weight_eps
-        # filled during explain(); bookkeeping for the objective-driven build.
+        self.use_logits = use_logits
+        self.focal_tau = focal_tau
+        self.gain_area_pow = gain_area_pow
         self._build_queries = 0
 
     # ------------------------------------------------------------------ #
     # Phi: blur-completion manifold-projection operator
     # ------------------------------------------------------------------ #
     def _phi(self, x: torch.Tensor, b: torch.Tensor, mask_bool: np.ndarray) -> torch.Tensor:
-        """Reveal `mask` sharp; complete the complement with blur reference b.
-
-        Phi_R(x) = m * x + (1 - m) * b,  m the (H,W) {0,1} region indicator.
-        """
         m = torch.as_tensor(mask_bool, dtype=x.dtype, device=x.device)
-        m = m.view(1, 1, *mask_bool.shape)  # (1,1,H,W) broadcast over channels
+        m = m.view(1, 1, *mask_bool.shape)
         return m * x + (1.0 - m) * b
 
-    def _target_prob(self, comp: torch.Tensor, target: int) -> float:
+    def _target_response(self, comp: torch.Tensor, target: int) -> float:
+        """Target-class response. Logit (default) or probability."""
         with torch.no_grad():
-            return float(F.softmax(self.model(comp), dim=1)[:, target].item())
+            out = self.model(comp)
+            if self.use_logits:
+                return float(out[:, target].item())
+            return float(F.softmax(out, dim=1)[:, target].item())
 
     def _value(self, x, b, mask_bool, x0_val: float, target: int) -> float:
-        """v(R) = f(Phi_R(x)) - f(x0), counting one forward pass."""
+        """v(R) = z_y(Phi_R(x)) - z_y(b), counting one forward pass."""
         self._build_queries += 1
-        return self._target_prob(self._phi(x, b, mask_bool), target) - x0_val
+        return self._target_response(self._phi(x, b, mask_bool), target) - x0_val
 
     # ------------------------------------------------------------------ #
     # leaf segmentation
     # ------------------------------------------------------------------ #
     def _leaf_labels(self, img01: np.ndarray) -> np.ndarray:
-        """Return an (H,W) int label map of leaf superpixels."""
         if _HAS_SKIMAGE:
             labels = slic(
                 img01,
@@ -175,26 +165,16 @@ class PyramidExplainer(Explainer):
                 channel_axis=2,
             )
             return labels.astype(np.int64)
-        # Fallback: regular grid tiling if skimage is unavailable.
         H, W = img01.shape[:2]
         side = max(1, int(round(np.sqrt(self.n_segments))))
         ys = np.linspace(0, side, H, endpoint=False).astype(np.int64)
         xs = np.linspace(0, side, W, endpoint=False).astype(np.int64)
-        labels = (ys[:, None] * side + xs[None, :]).astype(np.int64)
-        return labels
+        return (ys[:, None] * side + xs[None, :]).astype(np.int64)
 
     # ------------------------------------------------------------------ #
-    # blind proposal signal: backbone intermediate-feature map (model-blind:
-    # it never sees the target class or v; it just groups regions the network
-    # represents similarly, a better scaffold than raw color).
+    # blind proposal signal: backbone intermediate features (no target, no v)
     # ------------------------------------------------------------------ #
     def _feature_map(self, x: torch.Tensor, H: int, W: int) -> Optional[np.ndarray]:
-        """Return an (H,W,C) per-pixel feature map from `feature_layer`, or None.
-
-        Hooks the named module on the backbone, runs one forward pass on the
-        sharp input, and upsamples the activation to (H,W). Falls back to None
-        if the layer is not found, in which case the caller uses mean color.
-        """
         module = dict(self.model.named_modules()).get(self.feature_layer)
         if module is None:
             return None
@@ -212,22 +192,18 @@ class PyramidExplainer(Explainer):
         act = feats.get("act")
         if act is None:
             return None
-        # (1,C,h,w) -> (1,C,H,W) -> (H,W,C)
         act = F.interpolate(act, size=(H, W), mode="bilinear", align_corners=False)
-        fmap = act[0].permute(1, 2, 0).cpu().numpy().astype(np.float64)
-        return fmap
+        return act[0].permute(1, 2, 0).cpu().numpy().astype(np.float64)
 
     @staticmethod
     def _region_descriptor(desc_field: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Mean of a per-pixel descriptor field (color or feature) over a region."""
         return desc_field[mask].mean(axis=0)
 
     # ------------------------------------------------------------------ #
-    # agglomerative region tree -- greedy minimizer of J(T) = sum w(R)|Delta(R)|
+    # value-gain agglomerative tree
     # ------------------------------------------------------------------ #
     def _build_tree(
         self,
-        img01: np.ndarray,
         labels: np.ndarray,
         x: torch.Tensor,
         b: torch.Tensor,
@@ -235,17 +211,9 @@ class PyramidExplainer(Explainer):
         target: int,
         desc_field: np.ndarray,
     ) -> _Node:
-        """Build the tree by greedy descent on the merge objective.
-
-        desc_field: (H,W,D) per-pixel BLIND descriptor used only to shortlist
-        candidate merges (feature activations if available, else color). The
-        actual merge choice is MODEL-AWARE: among the shortlist we pick the pair
-        of least weighted residual w(u|v)*|v(u|v) - v(u) - v(v)|.
-        """
         H, W = labels.shape
         uniq = np.unique(labels)
 
-        # --- leaf nodes + their (cached) values v(leaf) ------------------- #
         next_id = 0
         nodes: dict[int, _Node] = {}
         for lab in uniq:
@@ -256,11 +224,8 @@ class PyramidExplainer(Explainer):
             next_id += 1
 
         active = set(nodes.keys())
-
-        # Blind descriptor per active region (for shortlisting only).
         desc = {nid: self._region_descriptor(desc_field, nodes[nid].mask) for nid in active}
 
-        # --- adjacency among current active regions ---------------------- #
         def adjacency(masks: dict[int, np.ndarray]) -> set:
             owner = -np.ones((H, W), dtype=np.int64)
             for nid, m in masks.items():
@@ -282,61 +247,47 @@ class PyramidExplainer(Explainer):
         def blind_dist(p) -> float:
             return float(np.linalg.norm(desc[p[0]] - desc[p[1]]))
 
-        def weight(area: int) -> float:
-            return 1.0 / (float(area) + self.weight_eps)
+        def gain(v_uv: float, v_u: float, v_v: float, area: int) -> float:
+            # value gained per pixel added: reward crossing the threshold,
+            # reward compactness (small area). Higher is better.
+            denom = float(area) ** self.gain_area_pow
+            return (v_uv - max(v_u, v_v)) / max(denom, 1.0)
 
-        # Greedy descent on J: each step, propose the k blind-closest adjacent
-        # pairs, then commit the one of least weighted residual (model-aware).
+        # Greedy MAXIMIZATION of value-gain. Each step: blind shortlist ->
+        # model-aware argmax of gain. The object region assembles first.
         while len(active) > 1:
             if not adj:
-                # Disconnected remainder (essentially never with 4-conn SLIC):
-                # merge the two spatially-closest actives by centroid -- a mild,
-                # principled fallback rather than an arbitrary pick.
+                # Disconnected remainder (rare): merge spatially-closest pair.
                 acts = list(active)
                 cents = {nid: np.argwhere(nodes[nid].mask).mean(axis=0) for nid in acts}
-                best = None
-                best_d = np.inf
+                best, best_d = None, np.inf
                 for i in range(len(acts)):
                     for j in range(i + 1, len(acts)):
                         d = float(np.linalg.norm(cents[acts[i]] - cents[acts[j]]))
                         if d < best_d:
                             best_d, best = d, (acts[i], acts[j])
                 u, v = best
-                v_uv = self._value(
-                    x, b, nodes[u].mask | nodes[v].mask, x0_val, target
-                )
+                v_uv = self._value(x, b, nodes[u].mask | nodes[v].mask, x0_val, target)
+            elif self.merge_mode == "color":
+                # Legacy pure-blind linkage (no model-aware selection).
+                u, v = min(adj, key=blind_dist)
+                v_uv = self._value(x, b, nodes[u].mask | nodes[v].mask, x0_val, target)
             else:
-                if self.merge_mode == "color":
-                    # Legacy: pure blind linkage, no model-aware selection.
-                    u, v = min(adj, key=blind_dist)
-                    v_uv = self._value(
-                        x, b, nodes[u].mask | nodes[v].mask, x0_val, target
-                    )
-                else:
-                    # Objective-driven: blind shortlist -> model-aware argmin.
-                    shortlist = sorted(adj, key=blind_dist)[: max(1, self.shortlist_k)]
-                    best = None
-                    best_score = np.inf
-                    best_vuv = 0.0
-                    for (p, q) in shortlist:
-                        merged_mask = nodes[p].mask | nodes[q].mask
-                        v_pq = self._value(x, b, merged_mask, x0_val, target)
-                        resid = v_pq - nodes[p].v - nodes[q].v
-                        score = weight(int(merged_mask.sum())) * abs(resid)
-                        if score < best_score:
-                            best_score = score
-                            best = (p, q)
-                            best_vuv = v_pq
-                    u, v = best
-                    v_uv = best_vuv  # reuse the chosen trial -> no re-evaluation
+                # focus mode: blind shortlist -> model-aware MAX value-gain.
+                shortlist = sorted(adj, key=blind_dist)[: max(1, self.shortlist_k)]
+                best, best_score, best_vuv = None, -np.inf, 0.0
+                for (p, q) in shortlist:
+                    merged_mask = nodes[p].mask | nodes[q].mask
+                    v_pq = self._value(x, b, merged_mask, x0_val, target)
+                    score = gain(v_pq, nodes[p].v, nodes[q].v, int(merged_mask.sum()))
+                    if score > best_score:
+                        best_score, best, best_vuv = score, (p, q), v_pq
+                u, v = best
+                v_uv = best_vuv  # reuse chosen trial -> no re-evaluation
 
             merged_mask = nodes[u].mask | nodes[v].mask
-            merged = _Node(
-                id=next_id,
-                mask=merged_mask,
-                children=[nodes[u], nodes[v]],
-                v=v_uv,  # cached: parent value is the chosen trial value
-            )
+            merged = _Node(id=next_id, mask=merged_mask,
+                           children=[nodes[u], nodes[v]], v=v_uv)
             nodes[next_id] = merged
             desc[next_id] = self._region_descriptor(desc_field, merged_mask)
 
@@ -344,7 +295,6 @@ class PyramidExplainer(Explainer):
             active.discard(v)
             active.add(next_id)
 
-            # Rebuild adjacency referencing the merged node.
             new_adj = set()
             for (p, q) in adj:
                 if p in (u, v):
@@ -356,24 +306,34 @@ class PyramidExplainer(Explainer):
             adj = new_adj
             next_id += 1
 
-        root_id = next(iter(active))
-        return nodes[root_id]
+        return nodes[next(iter(active))]
 
     # ------------------------------------------------------------------ #
-    # synergy fill (values are already cached during the build)
+    # synergy fill (values cached during build)
     # ------------------------------------------------------------------ #
     def _fill_deltas(self, root: _Node) -> None:
-        """Set Delta(R) = v(R) - sum_j v(c_j) for every internal node.
-
-        Values v(.) are cached on every node by _build_tree, so this is pure
-        arithmetic -- no further forward passes.
-        """
         stack = [root]
         while stack:
             n = stack.pop()
             if not n.is_leaf:
                 n.delta = n.v - sum(c.v for c in n.children)
                 stack.extend(n.children)
+
+    # ------------------------------------------------------------------ #
+    # focal node: minimal-area node with v(R*) >= tau * v(root)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _find_focal(root: _Node, tau: float) -> _Node:
+        target_v = tau * root.v
+        best = root
+        best_area = root.area
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if n.v >= target_v and n.area <= best_area:
+                best, best_area = n, n.area
+            stack.extend(n.children)
+        return best
 
     # ------------------------------------------------------------------ #
     # explain
@@ -383,36 +343,27 @@ class PyramidExplainer(Explainer):
         target = self._resolve_target(x)
         self._build_queries = 0
 
-        # On-manifold baseline / completion field: the strong-blur self-reference.
         b = blur_reference(x, self.sigma).to(self.device)
-
-        img01 = denormalize(x)[0].permute(1, 2, 0).cpu().numpy()  # (H,W,3) in [0,1]
+        img01 = denormalize(x)[0].permute(1, 2, 0).cpu().numpy()
         H, W = img01.shape[:2]
 
-        # f(x), f(x0) = f(b).
-        f_x = self._target_prob(x, target)
-        f_b = self._target_prob(b, target)  # x0 = full-blur reveal of nothing
+        f_x = self._target_response(x, target)
+        f_b = self._target_response(b, target)
         x0_val = f_b
 
-        # Leaf segmentation.
         labels = self._leaf_labels(img01)
 
-        # Blind proposal descriptor field: backbone features if available, else
-        # raw color. Model-BLIND (no target class, no v) by construction.
         desc_field = None
         if self.merge_mode != "color":
             desc_field = self._feature_map(x, H, W)
         feature_used = desc_field is not None
         if desc_field is None:
-            desc_field = img01  # (H,W,3) color fallback
+            desc_field = img01
 
-        # Build the objective-driven tree (values cached during build).
-        root = self._build_tree(img01, labels, x, b, x0_val, target, desc_field)
-
-        # Fill Delta from cached values (no extra forward passes).
+        root = self._build_tree(labels, x, b, x0_val, target, desc_field)
         self._fill_deltas(root)
 
-        # --- completeness-style identity check (telescoping) ---------------- #
+        # ---- collect nodes ------------------------------------------------ #
         leaves: list[_Node] = []
         internals: list[_Node] = []
 
@@ -424,45 +375,58 @@ class PyramidExplainer(Explainer):
         split(root)
         leaf_masks = {leaf.id: leaf.mask for leaf in leaves}
 
+        # ---- focal node (the compact evidence superregion) ---------------- #
+        focal = self._find_focal(root, self.focal_tau)
+        focal_leaves = []
+
+        def collect_focal_leaves(n: _Node):
+            if n.is_leaf:
+                focal_leaves.append(n)
+            for c in n.children:
+                collect_focal_leaves(c)
+
+        collect_focal_leaves(focal)
+
+        # ---- conservation self-check (telescoping) ------------------------ #
         sum_leaf_v = float(sum(l.v for l in leaves))
         sum_delta = float(sum(r.delta for r in internals))
-        identity_lhs = float(root.v)                 # v(root)
-        identity_rhs = sum_leaf_v + sum_delta        # sum leaf v + sum Delta
-        identity_residual = identity_lhs - identity_rhs  # ~0 up to float error
+        identity_lhs = float(root.v)
+        identity_rhs = sum_leaf_v + sum_delta
+        identity_residual = identity_lhs - identity_rhs
 
-        # --- merge-objective diagnostics ----------------------------------- #
-        # J(T) value and the non-additivity index, for reporting / tree-sensitivity.
-        def weight(area: int) -> float:
-            return 1.0 / (float(area) + self.weight_eps)
+        # ---- diagnostics: is the score concentrated, or root-takes-all? --- #
+        root_children = root.children
+        root_child_v = [float(c.v) for c in root_children]
+        root_v = float(root.v) if abs(root.v) > 1e-12 else 1e-12
+        focal_fraction = float(focal.v) / root_v          # want ~>= tau
+        focal_area_frac = focal.area / float(H * W)        # want small
+        root_delta_frac = float(root.delta) / root_v       # want ~0
+        # NAI for parity with the old report.
+        nai_denom = float(sum(abs(l.v) for l in leaves)) + float(
+            sum(abs(r.delta) for r in internals))
+        nai = (float(sum(abs(r.delta) for r in internals)) / nai_denom
+               if nai_denom > 0 else 0.0)
 
-        J_value = float(sum(weight(r.area) * abs(r.delta) for r in internals))
-        nai_denom = sum_leaf_v_abs = float(sum(abs(l.v) for l in leaves)) + float(
-            sum(abs(r.delta) for r in internals)
-        )
-        nai = (
-            float(sum(abs(r.delta) for r in internals)) / nai_denom
-            if nai_denom > 0
-            else 0.0
-        )
-
-        # --- per-pixel attribution: leaf-additive density ------------------- #
+        # ---- per-pixel attribution: FOCAL-subtree leaf density ------------ #
         attr = np.zeros((H, W), dtype=np.float64)
+        for leaf in focal_leaves:
+            attr[leaf.mask] = leaf.v / max(leaf.area, 1)
+
+        # full leaf-additive density (parity / comparison)
+        attr_all = np.zeros((H, W), dtype=np.float64)
         for leaf in leaves:
-            area = max(leaf.area, 1)
-            attr[leaf.mask] = leaf.v / area
+            attr_all[leaf.mask] = leaf.v / max(leaf.area, 1)
 
-        # Root reveal value via Phi, for parity with summary diagnostics.
-        f_phi = self._target_prob(self._phi(x, b, root.mask), target)
+        f_phi = self._target_response(self._phi(x, b, root.mask), target)
 
-        # --- serialize tree ------------------------------------------------- #
+        # ---- serialize tree ----------------------------------------------- #
         def serialize(n: _Node) -> dict:
             return {
-                "id": n.id,
-                "area": n.area,
-                "v": float(n.v),
-                "delta": float(n.delta),
+                "id": n.id, "area": n.area,
+                "v": float(n.v), "delta": float(n.delta),
                 "is_leaf": n.is_leaf,
                 "child_ids": [c.id for c in n.children],
+                "is_focal": n.id == focal.id,
             }
 
         all_serialized = []
@@ -474,11 +438,7 @@ class PyramidExplainer(Explainer):
 
         walk(root)
 
-        # Forward-pass accounting. The clean lower bound is 2n-1 (one value per
-        # node); the objective-driven build spends extra on rejected shortlist
-        # trials. _build_queries counts every v(.) evaluated during the build.
         n_leaves = len(leaves)
-        budget_2n_minus_1 = 2 * n_leaves - 1
 
         return AttributionResult(
             attribution=attr,
@@ -493,25 +453,39 @@ class PyramidExplainer(Explainer):
                 "n_segments": self.n_segments,
                 "n_leaves": n_leaves,
                 "n_internal": len(internals),
+                "value_space": "logit" if self.use_logits else "prob",
                 # --- value-query accounting --- #
-                "n_value_queries": self._build_queries,  # incl. rejected trials
-                "budget_2n_minus_1": budget_2n_minus_1,   # clean lower bound
-                # --- merge-objective settings + diagnostics --- #
+                "n_value_queries": self._build_queries,
+                "budget_2n_minus_1": 2 * n_leaves - 1,
+                # --- merge settings --- #
                 "merge_mode": self.merge_mode,
                 "shortlist_k": self.shortlist_k,
                 "feature_layer": self.feature_layer if feature_used else None,
                 "blind_signal": "feature" if feature_used else "color",
-                "weight_eps": self.weight_eps,
-                "J_objective": J_value,                  # sum_R w(R)|Delta(R)|
-                "NAI": nai,                              # non-additivity index
-                # --- tree + identity --- #
-                "root_v": float(root.v),
+                "gain_area_pow": self.gain_area_pow,
+                # --- focal node: the compact evidence superregion --- #
+                "focal_tau": self.focal_tau,
+                "focal_id": focal.id,
+                "focal_v": float(focal.v),
+                "focal_area": focal.area,
+                "focal_area_frac": focal_area_frac,     # want SMALL
+                "focal_fraction": focal_fraction,       # v(R*)/v(root), want >= tau
+                "focal_n_leaves": len(focal_leaves),
+                # --- root-takes-all diagnostics --- #
+                "root_v": root_v,
+                "root_child_v": root_child_v,           # both should be substantial
+                "root_delta": float(root.delta),
+                "root_delta_frac": root_delta_frac,     # want ~0, NOT >0.5
+                # --- conservation --- #
                 "sum_leaf_v": sum_leaf_v,
                 "sum_delta": sum_delta,
                 "identity_lhs": identity_lhs,
                 "identity_rhs": identity_rhs,
-                "identity_residual": identity_residual,  # telescoping check ~0
-                "tree": all_serialized,                  # full v/Delta per node
+                "identity_residual": identity_residual,
+                "NAI": nai,
+                # --- maps + tree --- #
+                "attr_all_leaves": attr_all,
+                "tree": all_serialized,
                 "leaf_masks": leaf_masks,
                 "reference": "blur_completion",
             },
