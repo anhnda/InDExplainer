@@ -229,3 +229,37 @@ def faithfulness(score_fn, model, x, attr, target, b,
 def query_cost(result) -> int:
     """Forward passes pyramid spent (one per tree-node value query)."""
     return int(result.extras.get("n_value_queries", -1))
+def synergy_attribution_map(result):
+    """(H,W) map: each pixel gets max|Delta| over tree nodes containing it.
+    The Delta-derived input for insertion/deletion. Needs extras['leaf_masks']."""
+    if "leaf_masks" not in result.extras:
+        raise ValueError("need extras['leaf_masks'] (apply the serialize patch)")
+    leaf_masks = result.extras["leaf_masks"]
+    tree = result.extras["tree"]
+    by_id = {n["id"]: n for n in tree}
+    H, W = next(iter(leaf_masks.values())).shape
+
+    cache = {}
+    def leaves_under(nid):
+        if nid in cache:
+            return cache[nid]
+        n = by_id[nid]
+        s = {nid} if n["is_leaf"] else set()
+        for c in n["child_ids"]:
+            s |= leaves_under(c)
+        cache[nid] = s
+        return s
+
+    leaf_score = {n["id"]: 0.0 for n in tree if n["is_leaf"]}
+    for n in tree:
+        if not n["is_leaf"]:
+            d = abs(n["delta"])
+            for lid in leaves_under(n["id"]):
+                if d > leaf_score[lid]:
+                    leaf_score[lid] = d
+
+    import numpy as np
+    attr = np.zeros((H, W), dtype=np.float64)
+    for lid, m in leaf_masks.items():
+        attr[m] = leaf_score[lid]
+    return attr
