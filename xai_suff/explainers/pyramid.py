@@ -96,7 +96,7 @@ class PyramidExplainer(Explainer):
         sigma: float = 11.0,              # blur strength for Phi complement
         n_segments: int = 144,            # target number of leaf superpixels (SLIC)
         compactness: float = 2,           # SLIC compactness
-        merge_criterion: str = "max_coop",  # "max_coop" (Delta) or "max_both" (|Delta|)
+        merge_criterion: str = "max_both",  # "max_coop" (Delta) or "max_both" (|Delta|)
         frontier_k: Optional[int] = None,   # cap candidate pairs scored per step
         suff_eps: float = 0.05,           # sufficiency: v(S) >= (1-eps) v(root)
         **kw,
