@@ -125,39 +125,101 @@ def select_coalition(args, model, x, b, cell_ids, n_cells, coefs, target, f0):
 # visualization
 # --------------------------------------------------------------------------- #
 def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
-               target_name, results, total):
+               target_name, results, total, per_cell, f0):
+    """Synergy panel.
+
+    Row of reveals: [input w/ A,B outlined] [reveal A: f(A)] [reveal B: f(B)]
+                    [reveal A,B: f(A,B)]   then a synergy bar:
+                    v(A)+v(B)  vs  v(A,B), with the gap g shaded.
+    Generalizes to k>2 (one reveal column per cell, capped for layout).
+    """
     img = denormalize(x)[0].permute(1, 2, 0).cpu().numpy()
-    blur = denormalize(b)[0].permute(1, 2, 0).cpu().numpy()
+    Hc, Wc = cell_ids.shape
+    labels = [chr(ord("A") + i) for i in range(len(sel_cells))]
 
-    coef_t = torch.tensor(coefs, dtype=torch.float32)
-    coef_map = coef_t[cell_ids.cpu()].numpy()
-    m = np.abs(coef_map).max() + 1e-12
+    def reveal_img(cells):
+        keep = torch.zeros_like(cell_ids, dtype=torch.float32)
+        for c in cells:
+            keep = keep + (cell_ids == c).float()
+        keep = keep.clamp(0, 1).view(1, 1, Hc, Wc).to(x.device)
+        comp = keep * x + (1 - keep) * b
+        return denormalize(comp)[0].permute(1, 2, 0).cpu().numpy()
 
-    keep = torch.zeros_like(cell_ids, dtype=torch.float32)
-    for c in sel_cells:
-        keep = keep + (cell_ids == c).float()
-    keep = keep.clamp(0, 1).view(1, 1, *cell_ids.shape).to(x.device)
-    comp = keep * x + (1 - keep) * b
-    comp_img = denormalize(comp)[0].permute(1, 2, 0).cpu().numpy()
-
-    fig, ax = plt.subplots(1, 4, figsize=(16, 4))
-    ax[0].imshow(img); ax[0].set_title("input"); ax[0].axis("off")
-    ax[1].imshow(blur); ax[1].set_title("blur reference b"); ax[1].axis("off")
-    im = ax[2].imshow(coef_map, cmap="seismic", vmin=-m, vmax=m)
-    ax[2].set_title(f"LIME coefficients ({grid[0]}x{grid[1]})"); ax[2].axis("off")
-    fig.colorbar(im, ax=ax[2], fraction=0.046)
-    ax[3].imshow(comp_img)
-    ax[3].set_title("selected reveal (rest=b)"); ax[3].axis("off")
+    def outline(ax, c, color):
+        """Draw a rectangle around cell c's region."""
+        ys, xs = torch.where(cell_ids.cpu() == c)
+        if len(ys) == 0:
+            return
+        y0, y1 = int(ys.min()), int(ys.max())
+        x0, x1 = int(xs.min()), int(xs.max())
+        ax.add_patch(plt.Rectangle((x0, y0), x1 - x0, y1 - y0,
+                                   fill=False, edgecolor=color, linewidth=2.5))
 
     v_joint = results["v_joint"]; v_sum = results["v_sum"]; g = results["synergy"]
+    cell_colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00"]
+
+    n_reveal = len(sel_cells)
+    n_cols = 1 + n_reveal + 1 + 1  # input | per-cell reveals | joint | synergy bar
+    fig, ax = plt.subplots(1, n_cols, figsize=(3.6 * n_cols, 4.0))
+
+    # --- input with all selected cells outlined ---
+    ax[0].imshow(img)
+    for k, c in enumerate(sel_cells):
+        outline(ax[0], c, cell_colors[k % len(cell_colors)])
+        ys, xs = torch.where(cell_ids.cpu() == c)
+        ax[0].text(int(xs.float().mean()), int(ys.float().mean()), labels[k],
+                   color="white", fontsize=15, fontweight="bold", ha="center",
+                   va="center", bbox=dict(boxstyle="round,pad=0.15",
+                                          fc=cell_colors[k % len(cell_colors)], ec="none"))
+    ax[0].set_title(f"input: regions {', '.join(labels)}"); ax[0].axis("off")
+
+    # --- each cell revealed alone ---
+    for k, c in enumerate(sel_cells):
+        a = ax[1 + k]
+        a.imshow(reveal_img([c]))
+        d = per_cell[c]
+        a.set_title(f"reveal {labels[k]} only\nf({labels[k]})={d['f_phi']:.3f}  "
+                    f"v={d['v']:+.3f}",
+                    color=cell_colors[k % len(cell_colors)])
+        a.axis("off")
+
+    # --- joint reveal ---
+    aj = ax[1 + n_reveal]
+    aj.imshow(reveal_img(sel_cells))
+    joint_lab = ",".join(labels)
+    aj.set_title(f"reveal {joint_lab}\nf({joint_lab})={results['f_phi_joint']:.3f}  "
+                 f"v={v_joint:+.3f}", color="black")
+    aj.axis("off")
+
+    # --- synergy bar: additive prediction vs actual joint ---
+    ab = ax[-1]
+    bottoms = 0.0
+    for k, c in enumerate(sel_cells):
+        vk = per_cell[c]["v"]
+        ab.bar(0, vk, bottom=bottoms, width=0.6,
+               color=cell_colors[k % len(cell_colors)],
+               label=f"v({labels[k]})={vk:+.3f}")
+        bottoms += vk
+    # synergy stacked on top of the additive sum
+    ab.bar(0, g, bottom=v_sum, width=0.6, color="#999999", hatch="//",
+           label=f"g={g:+.3f}")
+    ab.bar(1, v_joint, width=0.6, color="black", alpha=0.85,
+           label=f"v(joint)={v_joint:+.3f}")
+    ab.set_xticks([0, 1])
+    ab.set_xticklabels(["sum v(c)\n+ g", "actual\nv(joint)"])
+    ab.set_ylabel("target-prob gain over b")
+    ab.set_title(f"g = {g:+.3f}  ({g / (total + 1e-12) * 100:+.1f}% of f(x)-f(b))")
+    ab.legend(fontsize=7, loc="upper left")
+    ab.axhline(0, color="k", lw=0.6)
+
     fig.suptitle(
         f"class={target} ({target_name})   "
-        f"v(joint)={v_joint:+.4f}   sum v(c)={v_sum:+.4f}   "
-        f"g={g:+.4f}  ({g / (total + 1e-12) * 100:+.1f}% of f(x)-f(b))   "
-        f"({'cooperation' if g > 0 else 'redundancy'})"
+        f"v(joint)={v_joint:+.4f}   sum v(c)={v_sum:+.4f}   g={g:+.4f}   "
+        f"({'COOPERATION (whole>parts)' if g > 0 else 'REDUNDANCY (whole<parts)'})",
+        fontsize=12,
     )
     fig.tight_layout()
-    fig.savefig(out_path, dpi=110, bbox_inches="tight")
+    fig.savefig(out_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -254,7 +316,7 @@ def main():
 
     panel_path = os.path.join(args.out, "nonadditivity.png")
     save_panel(panel_path, x, b, cell_ids, sel_cells, coefs, grid,
-               target, target_name, results, total)
+               target, target_name, results, total, per_cell, f0)
 
     lines = [
         f"image: {args.image}",
