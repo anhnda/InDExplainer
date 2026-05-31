@@ -158,9 +158,17 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
     v_joint = results["v_joint"]; v_sum = results["v_sum"]; g = results["synergy"]
     cell_colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00"]
 
+    # ---- font sizes (bump these to scale the whole figure) ----
+    FS_TITLE = 18      # per-axis subplot titles
+    FS_BADGE = 26      # A / B region labels on the input
+    FS_AXLABEL = 16    # y-axis label
+    FS_TICK = 15       # x/y tick labels
+    FS_LEGEND = 14     # synergy-bar legend
+    FS_SUPTITLE = 20   # figure suptitle
+
     n_reveal = len(sel_cells)
     n_cols = 1 + n_reveal + 1 + 1  # input | per-cell reveals | joint | synergy bar
-    fig, ax = plt.subplots(1, n_cols, figsize=(3.6 * n_cols, 4.0))
+    fig, ax = plt.subplots(1, n_cols, figsize=(4.2 * n_cols, 4.8))
 
     # --- input with all selected cells outlined ---
     ax[0].imshow(img)
@@ -168,10 +176,11 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
         outline(ax[0], c, cell_colors[k % len(cell_colors)])
         ys, xs = torch.where(cell_ids.cpu() == c)
         ax[0].text(int(xs.float().mean()), int(ys.float().mean()), labels[k],
-                   color="white", fontsize=15, fontweight="bold", ha="center",
-                   va="center", bbox=dict(boxstyle="round,pad=0.15",
+                   color="white", fontsize=FS_BADGE, fontweight="bold", ha="center",
+                   va="center", bbox=dict(boxstyle="round,pad=0.2",
                                           fc=cell_colors[k % len(cell_colors)], ec="none"))
-    ax[0].set_title(f"input: regions {', '.join(labels)}"); ax[0].axis("off")
+    ax[0].set_title(f"input: regions {', '.join(labels)}", fontsize=FS_TITLE)
+    ax[0].axis("off")
 
     # --- each cell revealed alone ---
     for k, c in enumerate(sel_cells):
@@ -180,7 +189,7 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
         d = per_cell[c]
         a.set_title(f"reveal {labels[k]} only\nf({labels[k]})={d['f_phi']:.3f}  "
                     f"v={d['v']:+.3f}",
-                    color=cell_colors[k % len(cell_colors)])
+                    color=cell_colors[k % len(cell_colors)], fontsize=FS_TITLE)
         a.axis("off")
 
     # --- joint reveal ---
@@ -188,7 +197,7 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
     aj.imshow(reveal_img(sel_cells))
     joint_lab = ",".join(labels)
     aj.set_title(f"reveal {joint_lab}\nf({joint_lab})={results['f_phi_joint']:.3f}  "
-                 f"v={v_joint:+.3f}", color="black")
+                 f"v={v_joint:+.3f}", color="black", fontsize=FS_TITLE)
     aj.axis("off")
 
     # --- synergy bar: additive prediction vs actual joint ---
@@ -206,17 +215,19 @@ def save_panel(out_path, x, b, cell_ids, sel_cells, coefs, grid, target,
     ab.bar(1, v_joint, width=0.6, color="black", alpha=0.85,
            label=f"v(joint)={v_joint:+.3f}")
     ab.set_xticks([0, 1])
-    ab.set_xticklabels(["sum v(c)\n+ g", "actual\nv(joint)"])
-    ab.set_ylabel("target-prob gain over b")
-    ab.set_title(f"g = {g:+.3f}  ({g / (total + 1e-12) * 100:+.1f}% of f(x)-f(b))")
-    ab.legend(fontsize=7, loc="upper left")
+    ab.set_xticklabels(["sum v(c)\n+ g", "actual\nv(joint)"], fontsize=FS_TICK)
+    ab.tick_params(axis="y", labelsize=FS_TICK)
+    ab.set_ylabel("target-prob gain over b", fontsize=FS_AXLABEL)
+    ab.set_title(f"g = {g:+.3f}  ({g / (total + 1e-12) * 100:+.1f}% of f(x)-f(b))",
+                 fontsize=FS_TITLE)
+    ab.legend(fontsize=FS_LEGEND, loc="upper left")
     ab.axhline(0, color="k", lw=0.6)
 
     fig.suptitle(
         f"class={target} ({target_name})   "
         f"v(joint)={v_joint:+.4f}   sum v(c)={v_sum:+.4f}   g={g:+.4f}   "
         f"({'COOPERATION (whole>parts)' if g > 0 else 'REDUNDANCY (whole<parts)'})",
-        fontsize=12,
+        fontsize=FS_SUPTITLE,
     )
     fig.tight_layout()
     fig.savefig(out_path, dpi=120, bbox_inches="tight")
