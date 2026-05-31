@@ -22,6 +22,7 @@ Usage:
     python verify_nonadditivity.py --image img/church.JPEG --out nonadd_out
         [--select pair] [--grid 6 6] [--topk 2] [--n-candidates 24]
         [--target 497] [--sigma 50] [--device cpu] [--n-samples 1000]
+        [--no-neighbor]
 """
 from __future__ import annotations
 
@@ -57,6 +58,14 @@ def cell_id_map(H: int, W: int, grid) -> torch.Tensor:
     return ys.view(-1, 1) * gw + xs.view(1, -1)  # (H,W)
 
 
+def are_neighbors(i: int, j: int, grid) -> bool:
+    """True if flat cell indices i, j are 4-connected (edge-adjacent) on the grid."""
+    gh, gw = grid
+    ri, ci = divmod(i, gw)
+    rj, cj = divmod(j, gw)
+    return abs(ri - rj) + abs(ci - cj) == 1
+
+
 @torch.no_grad()
 def reveal_value(model, x, b, cell_ids, keep_cells, target, f0):
     """v(S) = f(Phi_S(x)) - f0, revealing only the cells in `keep_cells` (a set).
@@ -88,6 +97,7 @@ def all_single_values(model, x, b, cell_ids, n_cells, target, f0):
 # --------------------------------------------------------------------------- #
 def select_coalition(args, model, x, b, cell_ids, n_cells, coefs, target, f0):
     """Return (selected_cells:list, single_v:dict[c]->v, note:str)."""
+    grid = tuple(args.grid)
     if args.select == "lime":
         order = np.argsort(-coefs)
         cells = [int(c) for c in order[: args.topk]]
@@ -109,14 +119,24 @@ def select_coalition(args, model, x, b, cell_ids, n_cells, coefs, target, f0):
         cand = [int(c) for c in np.argsort(-vs)[: args.n_candidates]]
         best = None  # (abs_g, (i,j), v_i, v_j, v_ij, g)
         for i, j in itertools.combinations(cand, 2):
+            if args.neighbor and not are_neighbors(i, j, grid):
+                continue
             v_ij, _ = reveal_value(model, x, b, cell_ids, {i, j}, target, f0)
             g = v_ij - vs[i] - vs[j]
             if best is None or abs(g) > best[0]:
                 best = (abs(g), (i, j), float(vs[i]), float(vs[j]),
                         float(v_ij), float(g))
+        if best is None:
+            raise RuntimeError(
+                "no neighboring pair found among the top-"
+                f"{args.n_candidates} candidates; rerun with --no-neighbor "
+                "or increase --n-candidates / --grid resolution"
+            )
         (_, (i, j), v_i, v_j, _, _) = best
         sv = {i: v_i, j: v_j}
-        return [i, j], sv, f"max-|g| pair among top-{args.n_candidates} by v(c)"
+        adj = "adjacent " if args.neighbor else ""
+        return [i, j], sv, (f"max-|g| {adj}pair among top-{args.n_candidates} "
+                            f"by v(c)")
 
     raise ValueError(args.select)
 
@@ -250,6 +270,10 @@ def main():
     ap.add_argument("--select", choices=["lime", "value", "pair"], default="pair")
     ap.add_argument("--n-candidates", type=int, default=24,
                     help="pair-mode: shortlist size (by v(c)) before brute-force |g|")
+    ap.add_argument("--neighbor", dest="neighbor", action="store_true", default=True,
+                    help="pair-mode: restrict search to edge-adjacent cells (default)")
+    ap.add_argument("--no-neighbor", dest="neighbor", action="store_false",
+                    help="pair-mode: allow any pair, not just neighbors")
     ap.add_argument("--sigma", type=float, default=50.0)
     ap.add_argument("--n-samples", type=int, default=1000)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
