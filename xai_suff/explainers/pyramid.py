@@ -8,8 +8,40 @@ Implements the method note (PyramidExplainer.md) against the package contract:
 Core construction
 -----------------
 1. Segment the image into superpixels (leaves).
-2. Build an agglomerative region tree T by repeatedly merging the most similar
-   adjacent regions (leaves -> ... -> root = whole image).
+2. Build an agglomerative region tree T as the GREEDY MINIMIZER of an explicit
+   tree objective, NOT as an ad-hoc "merge most-similar pair" loop:
+
+       J(T) = sum_{R in I} w(R) * |Delta(R)|,   w(R) = 1 / area(R)
+
+   Rationale (P1 leaf honesty, P2 localization): every tree is exactly correct
+   (the telescoping identity below holds for ANY partition tree), so the tree
+   cannot change correctness -- it only chooses WHERE on the scale axis the
+   (conserved) non-additivity mass appears. We want fine-scale merges additive
+   (small |Delta|, weighted heavily by 1/area) and synergy concentrated at a few
+   coarse nodes. Minimizing J pushes residual mass upward.
+
+   Each merge creates exactly one internal node, so committing (u,v) adds a
+   single term w(u|v)*|Delta(u|v)| to J. The steepest-descent step is therefore
+
+       (u*,v*) = argmin_{(u,v) in adj} w(u|v) * | v(u|v) - v(u) - v(v) |
+
+   This is Ward's method with a MODEL-DEFINED linkage: we merge the adjacent
+   pair of least *explanation non-additivity* increase, evaluating f under Phi
+   rather than comparing colors. The merge rule is the derivative of J, not an
+   independent heuristic.
+
+   We minimize (not maximize) |Delta|: a synergy that survives a tree built to
+   defer it is robust evidence; one found by a tree built to seek it is an
+   artifact. Minimization is what P1/P2 demand and what makes residuals trusted.
+
+   Cost control -- "blind proposal, model-aware selection": a pure greedy would
+   trial v(u|v) for every adjacent pair every level (O(nE) forward passes). We
+   instead shortlist the k most-similar adjacent pairs by a *blind* signal
+   (backbone intermediate-feature distance, falling back to mean color), then
+   score only those k by the model-aware criterion. Chosen-merge values are
+   cached and reused as tree nodes, so only the <= k-1 rejected trials cost
+   extra passes => O(n*k) forward passes, a tunable constant over 2n-1.
+
 3. Holistic on-manifold value of any region R (blur-completion Phi):
 
        Phi_R(x) = reveal R sharp, replace complement R^c with blur_sigma(x)
@@ -21,20 +53,19 @@ Core construction
 
    Delta>0 cooperation, Delta<0 redundancy.
 
-5. Completeness-style identity (telescoping):
+5. Completeness-style identity (telescoping), preserved because the tree stays a
+   strict binary partition -- only WHICH coalitions are sampled changes:
 
        v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
 
 Per-pixel attribution
 ----------------------
 The returned (H,W) map is the leaf-additive part: each pixel takes the value of
-its leaf superpixel, v(leaf) / area(leaf) (a per-pixel density of the leaf's
-holistic value). Interaction is reported separately in `extras` (the full tree
-with each node's v and Delta), since "synergy at scale s" is tree-relative and
-not a per-pixel quantity (see method note section 4, tree-dependence caveat).
+its leaf superpixel, v(leaf) / area(leaf). Interaction is reported separately in
+`extras` (the full tree with each node's v and Delta).
 
-Reference dependence (Phi, tree) is stated, not hidden: the chosen sigma and
-segmentation parameters are logged in `extras`.
+Reference dependence (Phi, tree) is stated, not hidden: chosen sigma, segmentation
+params, merge objective settings, and the value-query budget are logged in `extras`.
 """
 from __future__ import annotations
 
@@ -89,7 +120,12 @@ class PyramidExplainer(Explainer):
         sigma: float = 11.0,        # blur strength for Phi complement (on-manifold)
         n_segments: int = 144,       # target number of leaf superpixels (SLIC)
         compactness: float = 2,  # SLIC compactness
-        max_nodes: Optional[int] = None,  # cap on internal-node value queries
+        max_nodes: Optional[int] = None,  # (unused now; kept for API compat)
+        # --- merge-objective controls ----------------------------------- #
+        shortlist_k: int = 6,        # blind-proposal shortlist size per merge step
+        feature_layer: str = "layer3",  # backbone layer for blind feature distance
+        merge_mode: str = "value",   # "value" (objective-driven) | "color" (legacy)
+        weight_eps: float = 1.0,     # w(R) = 1 / (area(R) + weight_eps)
         **kw,
     ):
         super().__init__(*args, **kw)
@@ -97,6 +133,12 @@ class PyramidExplainer(Explainer):
         self.n_segments = n_segments
         self.compactness = compactness
         self.max_nodes = max_nodes
+        self.shortlist_k = shortlist_k
+        self.feature_layer = feature_layer
+        self.merge_mode = merge_mode
+        self.weight_eps = weight_eps
+        # filled during explain(); bookkeeping for the objective-driven build.
+        self._build_queries = 0
 
     # ------------------------------------------------------------------ #
     # Phi: blur-completion manifold-projection operator
@@ -113,6 +155,11 @@ class PyramidExplainer(Explainer):
     def _target_prob(self, comp: torch.Tensor, target: int) -> float:
         with torch.no_grad():
             return float(F.softmax(self.model(comp), dim=1)[:, target].item())
+
+    def _value(self, x, b, mask_bool, x0_val: float, target: int) -> float:
+        """v(R) = f(Phi_R(x)) - f(x0), counting one forward pass."""
+        self._build_queries += 1
+        return self._target_prob(self._phi(x, b, mask_bool), target) - x0_val
 
     # ------------------------------------------------------------------ #
     # leaf segmentation
@@ -137,36 +184,88 @@ class PyramidExplainer(Explainer):
         return labels
 
     # ------------------------------------------------------------------ #
-    # agglomerative region tree (merge most-similar adjacent regions)
+    # blind proposal signal: backbone intermediate-feature map (model-blind:
+    # it never sees the target class or v; it just groups regions the network
+    # represents similarly, a better scaffold than raw color).
     # ------------------------------------------------------------------ #
-    def _build_tree(self, img01: np.ndarray, labels: np.ndarray) -> _Node:
+    def _feature_map(self, x: torch.Tensor, H: int, W: int) -> Optional[np.ndarray]:
+        """Return an (H,W,C) per-pixel feature map from `feature_layer`, or None.
+
+        Hooks the named module on the backbone, runs one forward pass on the
+        sharp input, and upsamples the activation to (H,W). Falls back to None
+        if the layer is not found, in which case the caller uses mean color.
+        """
+        module = dict(self.model.named_modules()).get(self.feature_layer)
+        if module is None:
+            return None
+        feats = {}
+
+        def hook(_m, _inp, out):
+            feats["act"] = out.detach()
+
+        handle = module.register_forward_hook(hook)
+        try:
+            with torch.no_grad():
+                self.model(x)
+        finally:
+            handle.remove()
+        act = feats.get("act")
+        if act is None:
+            return None
+        # (1,C,h,w) -> (1,C,H,W) -> (H,W,C)
+        act = F.interpolate(act, size=(H, W), mode="bilinear", align_corners=False)
+        fmap = act[0].permute(1, 2, 0).cpu().numpy().astype(np.float64)
+        return fmap
+
+    @staticmethod
+    def _region_descriptor(desc_field: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Mean of a per-pixel descriptor field (color or feature) over a region."""
+        return desc_field[mask].mean(axis=0)
+
+    # ------------------------------------------------------------------ #
+    # agglomerative region tree -- greedy minimizer of J(T) = sum w(R)|Delta(R)|
+    # ------------------------------------------------------------------ #
+    def _build_tree(
+        self,
+        img01: np.ndarray,
+        labels: np.ndarray,
+        x: torch.Tensor,
+        b: torch.Tensor,
+        x0_val: float,
+        target: int,
+        desc_field: np.ndarray,
+    ) -> _Node:
+        """Build the tree by greedy descent on the merge objective.
+
+        desc_field: (H,W,D) per-pixel BLIND descriptor used only to shortlist
+        candidate merges (feature activations if available, else color). The
+        actual merge choice is MODEL-AWARE: among the shortlist we pick the pair
+        of least weighted residual w(u|v)*|v(u|v) - v(u) - v(v)|.
+        """
         H, W = labels.shape
         uniq = np.unique(labels)
 
-        # Leaf nodes.
+        # --- leaf nodes + their (cached) values v(leaf) ------------------- #
         next_id = 0
         nodes: dict[int, _Node] = {}
         for lab in uniq:
             mask = labels == lab
-            nodes[next_id] = _Node(id=next_id, mask=mask, children=[])
+            node = _Node(id=next_id, mask=mask, children=[])
+            node.v = self._value(x, b, mask, x0_val, target)  # leaf value, cached
+            nodes[next_id] = node
             next_id += 1
 
         active = set(nodes.keys())
 
-        # Region mean color and adjacency.
-        def mean_color(mask: np.ndarray) -> np.ndarray:
-            return img01[mask].mean(axis=0)
+        # Blind descriptor per active region (for shortlisting only).
+        desc = {nid: self._region_descriptor(desc_field, nodes[nid].mask) for nid in active}
 
-        colors = {nid: mean_color(nodes[nid].mask) for nid in active}
-
-        # Adjacency among current active regions.
+        # --- adjacency among current active regions ---------------------- #
         def adjacency(masks: dict[int, np.ndarray]) -> set:
-            # Two regions are adjacent if any 4-neighbour pixels differ in owner.
             owner = -np.ones((H, W), dtype=np.int64)
             for nid, m in masks.items():
                 owner[m] = nid
             pairs = set()
-            # horizontal & vertical neighbour comparisons
             a, b_ = owner[:, :-1], owner[:, 1:]
             for u, v in zip(a[a != b_], b_[a != b_]):
                 if u >= 0 and v >= 0:
@@ -180,28 +279,66 @@ class PyramidExplainer(Explainer):
         masks = {nid: nodes[nid].mask for nid in active}
         adj = adjacency(masks)
 
-        # Greedy agglomeration: at each step merge the adjacent pair with the
-        # smallest mean-color distance, until a single root remains.
+        def blind_dist(p) -> float:
+            return float(np.linalg.norm(desc[p[0]] - desc[p[1]]))
+
+        def weight(area: int) -> float:
+            return 1.0 / (float(area) + self.weight_eps)
+
+        # Greedy descent on J: each step, propose the k blind-closest adjacent
+        # pairs, then commit the one of least weighted residual (model-aware).
         while len(active) > 1:
             if not adj:
-                # Disconnected remainder: merge arbitrary two actives.
-                it = iter(active)
-                u = next(it)
-                v = next(it)
-            else:
-                u, v = min(
-                    adj,
-                    key=lambda p: float(np.linalg.norm(colors[p[0]] - colors[p[1]])),
+                # Disconnected remainder (essentially never with 4-conn SLIC):
+                # merge the two spatially-closest actives by centroid -- a mild,
+                # principled fallback rather than an arbitrary pick.
+                acts = list(active)
+                cents = {nid: np.argwhere(nodes[nid].mask).mean(axis=0) for nid in acts}
+                best = None
+                best_d = np.inf
+                for i in range(len(acts)):
+                    for j in range(i + 1, len(acts)):
+                        d = float(np.linalg.norm(cents[acts[i]] - cents[acts[j]]))
+                        if d < best_d:
+                            best_d, best = d, (acts[i], acts[j])
+                u, v = best
+                v_uv = self._value(
+                    x, b, nodes[u].mask | nodes[v].mask, x0_val, target
                 )
+            else:
+                if self.merge_mode == "color":
+                    # Legacy: pure blind linkage, no model-aware selection.
+                    u, v = min(adj, key=blind_dist)
+                    v_uv = self._value(
+                        x, b, nodes[u].mask | nodes[v].mask, x0_val, target
+                    )
+                else:
+                    # Objective-driven: blind shortlist -> model-aware argmin.
+                    shortlist = sorted(adj, key=blind_dist)[: max(1, self.shortlist_k)]
+                    best = None
+                    best_score = np.inf
+                    best_vuv = 0.0
+                    for (p, q) in shortlist:
+                        merged_mask = nodes[p].mask | nodes[q].mask
+                        v_pq = self._value(x, b, merged_mask, x0_val, target)
+                        resid = v_pq - nodes[p].v - nodes[q].v
+                        score = weight(int(merged_mask.sum())) * abs(resid)
+                        if score < best_score:
+                            best_score = score
+                            best = (p, q)
+                            best_vuv = v_pq
+                    u, v = best
+                    v_uv = best_vuv  # reuse the chosen trial -> no re-evaluation
 
             merged_mask = nodes[u].mask | nodes[v].mask
             merged = _Node(
                 id=next_id,
                 mask=merged_mask,
                 children=[nodes[u], nodes[v]],
+                v=v_uv,  # cached: parent value is the chosen trial value
             )
             nodes[next_id] = merged
-            colors[next_id] = mean_color(merged_mask)
+            desc[next_id] = self._region_descriptor(desc_field, merged_mask)
 
             active.discard(u)
             active.discard(v)
@@ -223,37 +360,20 @@ class PyramidExplainer(Explainer):
         return nodes[root_id]
 
     # ------------------------------------------------------------------ #
-    # value + synergy computation over the tree
+    # synergy fill (values are already cached during the build)
     # ------------------------------------------------------------------ #
-    def _compute_values(self, root: _Node, x, b, x0_val: float, target: int):
-        """Fill v(R) for every node, then Delta(R) for internal nodes.
+    def _fill_deltas(self, root: _Node) -> None:
+        """Set Delta(R) = v(R) - sum_j v(c_j) for every internal node.
 
-        x0_val = f(x0) = f(b): the baseline subtracted in v(R) = f(Phi_R) - f(x0).
-        Returns (n_value_queries,).
+        Values v(.) are cached on every node by _build_tree, so this is pure
+        arithmetic -- no further forward passes.
         """
-        # Gather nodes (optionally cap internal queries by area-priority).
-        all_nodes: list[_Node] = []
-
-        def collect(n: _Node):
-            all_nodes.append(n)
-            for c in n.children:
-                collect(c)
-
-        collect(root)
-
-        # Value query for each node: v(R) = f(Phi_R(x)) - f(x0).
-        n_queries = 0
-        for node in all_nodes:
-            f_phi = self._target_prob(self._phi(x, b, node.mask), target)
-            node.v = f_phi - x0_val
-            n_queries += 1
-
-        # Synergy (whole minus parts), bottom-up implicit (children already have v).
-        for node in all_nodes:
-            if not node.is_leaf:
-                node.delta = node.v - sum(c.v for c in node.children)
-
-        return n_queries
+        stack = [root]
+        while stack:
+            n = stack.pop()
+            if not n.is_leaf:
+                n.delta = n.v - sum(c.v for c in n.children)
+                stack.extend(n.children)
 
     # ------------------------------------------------------------------ #
     # explain
@@ -261,6 +381,7 @@ class PyramidExplainer(Explainer):
     def explain(self, x: torch.Tensor) -> AttributionResult:
         x = x.to(self.device)
         target = self._resolve_target(x)
+        self._build_queries = 0
 
         # On-manifold baseline / completion field: the strong-blur self-reference.
         b = blur_reference(x, self.sigma).to(self.device)
@@ -270,15 +391,26 @@ class PyramidExplainer(Explainer):
 
         # f(x), f(x0) = f(b).
         f_x = self._target_prob(x, target)
-        f_b = self._target_prob(b, target)  # this is x0 = full-blur reveal of nothing
+        f_b = self._target_prob(b, target)  # x0 = full-blur reveal of nothing
         x0_val = f_b
 
-        # Build leaf segmentation and agglomerative tree.
+        # Leaf segmentation.
         labels = self._leaf_labels(img01)
-        root = self._build_tree(img01, labels)
 
-        # Fill v(R) and Delta(R) across the tree.
-        n_queries = self._compute_values(root, x, b, x0_val, target)
+        # Blind proposal descriptor field: backbone features if available, else
+        # raw color. Model-BLIND (no target class, no v) by construction.
+        desc_field = None
+        if self.merge_mode != "color":
+            desc_field = self._feature_map(x, H, W)
+        feature_used = desc_field is not None
+        if desc_field is None:
+            desc_field = img01  # (H,W,3) color fallback
+
+        # Build the objective-driven tree (values cached during build).
+        root = self._build_tree(img01, labels, x, b, x0_val, target, desc_field)
+
+        # Fill Delta from cached values (no extra forward passes).
+        self._fill_deltas(root)
 
         # --- completeness-style identity check (telescoping) ---------------- #
         leaves: list[_Node] = []
@@ -290,8 +422,7 @@ class PyramidExplainer(Explainer):
                 split(c)
 
         split(root)
-        leaf_masks = {leaf.id: leaf.mask for leaf in leaves}   # <-- add
-
+        leaf_masks = {leaf.id: leaf.mask for leaf in leaves}
 
         sum_leaf_v = float(sum(l.v for l in leaves))
         sum_delta = float(sum(r.delta for r in internals))
@@ -299,21 +430,31 @@ class PyramidExplainer(Explainer):
         identity_rhs = sum_leaf_v + sum_delta        # sum leaf v + sum Delta
         identity_residual = identity_lhs - identity_rhs  # ~0 up to float error
 
+        # --- merge-objective diagnostics ----------------------------------- #
+        # J(T) value and the non-additivity index, for reporting / tree-sensitivity.
+        def weight(area: int) -> float:
+            return 1.0 / (float(area) + self.weight_eps)
+
+        J_value = float(sum(weight(r.area) * abs(r.delta) for r in internals))
+        nai_denom = sum_leaf_v_abs = float(sum(abs(l.v) for l in leaves)) + float(
+            sum(abs(r.delta) for r in internals)
+        )
+        nai = (
+            float(sum(abs(r.delta) for r in internals)) / nai_denom
+            if nai_denom > 0
+            else 0.0
+        )
+
         # --- per-pixel attribution: leaf-additive density ------------------- #
-        # Each pixel takes its leaf's holistic value spread over the leaf area,
-        # so summing the map recovers sum_{leaves} v(leaf) (the additive part).
         attr = np.zeros((H, W), dtype=np.float64)
         for leaf in leaves:
             area = max(leaf.area, 1)
             attr[leaf.mask] = leaf.v / area
 
-        # f_phi reported as the root reveal value (whole image sharp) for parity
-        # with the summary panel diagnostics; equals f(x) when the root mask is
-        # the full frame, but is computed via Phi for consistency.
+        # Root reveal value via Phi, for parity with summary diagnostics.
         f_phi = self._target_prob(self._phi(x, b, root.mask), target)
 
-        # Serialize the tree (id, area, v, delta, child ids) for downstream
-        # interaction analysis -- synergy is tree-relative, not per-pixel.
+        # --- serialize tree ------------------------------------------------- #
         def serialize(n: _Node) -> dict:
             return {
                 "id": n.id,
@@ -333,6 +474,12 @@ class PyramidExplainer(Explainer):
 
         walk(root)
 
+        # Forward-pass accounting. The clean lower bound is 2n-1 (one value per
+        # node); the objective-driven build spends extra on rejected shortlist
+        # trials. _build_queries counts every v(.) evaluated during the build.
+        n_leaves = len(leaves)
+        budget_2n_minus_1 = 2 * n_leaves - 1
+
         return AttributionResult(
             attribution=attr,
             method=self.name,
@@ -344,9 +491,20 @@ class PyramidExplainer(Explainer):
             extras={
                 "sigma": self.sigma,
                 "n_segments": self.n_segments,
-                "n_leaves": len(leaves),
+                "n_leaves": n_leaves,
                 "n_internal": len(internals),
-                "n_value_queries": n_queries,
+                # --- value-query accounting --- #
+                "n_value_queries": self._build_queries,  # incl. rejected trials
+                "budget_2n_minus_1": budget_2n_minus_1,   # clean lower bound
+                # --- merge-objective settings + diagnostics --- #
+                "merge_mode": self.merge_mode,
+                "shortlist_k": self.shortlist_k,
+                "feature_layer": self.feature_layer if feature_used else None,
+                "blind_signal": "feature" if feature_used else "color",
+                "weight_eps": self.weight_eps,
+                "J_objective": J_value,                  # sum_R w(R)|Delta(R)|
+                "NAI": nai,                              # non-additivity index
+                # --- tree + identity --- #
                 "root_v": float(root.v),
                 "sum_leaf_v": sum_leaf_v,
                 "sum_delta": sum_delta,
@@ -354,7 +512,7 @@ class PyramidExplainer(Explainer):
                 "identity_rhs": identity_rhs,
                 "identity_residual": identity_residual,  # telescoping check ~0
                 "tree": all_serialized,                  # full v/Delta per node
-                "leaf_masks": leaf_masks,                        # <-- add
+                "leaf_masks": leaf_masks,
                 "reference": "blur_completion",
             },
         )
