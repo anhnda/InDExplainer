@@ -354,6 +354,19 @@ def export_interactive_html(res, img01, path: str, leaf_masks=None,
 
     img_b64 = _img_to_base64_png(img01)
 
+    # ---- v2: three tabbed views (icicle / ranked / dendrogram) ---- #
+    try:
+        import pyramid_views as PV
+        helpers = (_tree, _by_id, _root_id, _depths, _node_mask, _rle_rows)
+        payload = PV.build_payload(res, img_b64, leaf_masks, helpers,
+                                   max_nodes_with_masks)
+        html = PV.render(res, img_b64, payload)
+        with open(path, "w") as fh:
+            fh.write(html)
+        return path
+    except ImportError:
+        pass  # fall through to the legacy single-icicle template below
+
     meta = {
         "H": H, "W": W,
         "root": int(root_id),
