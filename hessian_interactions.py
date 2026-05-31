@@ -103,33 +103,40 @@ def pyramid_grid_matrix(res, leaf_masks: dict, k: int) -> np.ndarray:
 # criterion A: agreement vs model-actual matrix
 # --------------------------------------------------------------------------- #
 def agreement_scores(I_method: np.ndarray, I_actual: np.ndarray) -> dict:
-    """Compare a method matrix to the model-actual matrix on shared off-diagonal."""
+    """Compare a method matrix to the model-actual matrix on shared off-diagonal.
+
+    Returns an `applicable` flag: if the method has essentially no off-diagonal
+    mass (e.g. pyramid, diagonal by construction), off-diagonal correlation is
+    undefined, not zero -- the method simply does not make pairwise claims, so it
+    must NOT be scored as if it tried and failed. Callers should treat
+    applicable=False as "N/A", never as a loss or a win.
+    """
     a = _off_diag(I_method).astype(np.float64)
     g = _off_diag(I_actual).astype(np.float64)
 
-    # Pearson r (guard against zero variance, e.g. a diagonal-only matrix)
-    if a.std() < 1e-12 or g.std() < 1e-12:
-        r = 0.0
+    mass_actual = float(np.abs(g).sum())
+    mass_method = float(np.abs(a).sum())
+    # method makes no off-diagonal claim -> correlation is N/A, not 0
+    applicable = mass_method > 1e-9 * (mass_actual + 1e-12)
+
+    if not applicable or a.std() < 1e-12 or g.std() < 1e-12:
+        r = float("nan")
     else:
         r = float(np.corrcoef(a, g)[0, 1])
 
-    # sign agreement on entries where the actual is non-trivial
     sig = np.abs(g) > (1e-3 * (np.abs(g).max() or 1.0))
-    if sig.sum() == 0:
-        sign_agree = 0.0
+    if not applicable or sig.sum() == 0:
+        sign_agree = float("nan")
     else:
         sign_agree = float((np.sign(a[sig]) == np.sign(g[sig])).mean())
 
-    # off-diagonal mass recovery: how much of the actual non-additive mass the
-    # method accounts for (ratio of L1 masses; 1.0 = same magnitude budget)
-    mass_actual = float(np.abs(g).sum())
-    mass_method = float(np.abs(a).sum())
     mass_ratio = float(mass_method / mass_actual) if mass_actual > 0 else 0.0
 
     return {
+        "applicable": bool(applicable),
         "offdiag_pearson_r": r,
         "offdiag_sign_agreement": sign_agree,
-        "offdiag_mass_ratio": mass_ratio,
+        "offdiag_mass_ratio": mass_ratio,   # |1.0| = right magnitude budget
         "offdiag_mass_actual": mass_actual,
         "offdiag_mass_method": mass_method,
     }
@@ -139,30 +146,79 @@ def agreement_scores(I_method: np.ndarray, I_actual: np.ndarray) -> dict:
 # criterion B: delta-faithfulness for Hessian-IG (predict 2-cell reveals)
 # --------------------------------------------------------------------------- #
 def hessian_delta_faithfulness(
-    res_hess, model, x, b, target, k: int, n_pairs: int = 24, seed: int = 0
+    res_hess, res_pyr, model, x, b, target, k: int,
+    n_regions: int = 40, seed: int = 0,
 ):
-    """Do Hessian off-diagonals improve prediction of measured 2-cell reveals?
+    """Do Hessian terms improve prediction of measured REGION reveals?
 
-    For random cell pairs (i,j): measure v(S) = f(reveal S) - f(b) for
-    S in {i}, {j}, {i,j} by direct blur-completion reveal. Compare:
-        additive prediction      v_hat_add = v(i) + v(j)
-        interaction prediction   v_hat_int = v(i) + v(j) + Phi_ij
-    against the measured v({i,j}). Lower interaction error => Hessian term real.
+    Earlier this probed single k=14 cells, where v(cell) ~ 0 (a single 1/196 tile
+    barely moves the logit), so additive error was ~0 by triviality and the test
+    was uninformative. Fix per request: reuse pyramid's tree nodes as the reveal
+    regions -- the same regions pyramid's own delta-faithfulness validates -- so
+    both methods are tested on identical, non-trivial coalitions.
+
+    For each internal node R covering cell-set C(R):
+      measured     v(R)      = f(reveal R) - f(b)              [direct forward]
+      additive     v_add(R)  = sum_{c in C(R)} Gamma_cc        [Hessian main effects]
+      interaction  v_int(R)  = sum_{c} Gamma_cc
+                               + sum_{c<c' in C(R)} 2*Gamma_cc' [+ pairwise terms]
+    The factor 2 is because interaction-completeness counts each unordered pair
+    twice (Gamma is symmetric; sum_i sum_j includes (i,j) and (j,i)).
+
+    Lower interaction error than additive error => the Hessian off-diagonals carry
+    real, faithful signal at region scale. Needs res_pyr.extras['leaf_masks'].
     """
     import torch
     import torch.nn.functional as F
 
-    I = res_hess.extras["interaction_matrix"]
+    if "leaf_masks" not in res_pyr.extras:
+        return {"skipped": "pyramid extras['leaf_masks'] missing"}
+
+    I = res_hess.extras["interaction_matrix"]          # (K,K) Gamma
+    leaf_masks = res_pyr.extras["leaf_masks"]
+    tree = res_pyr.extras["tree"]
+    by_id = {n["id"]: n for n in tree}
     _, _, H, W = x.shape
     slices = _cell_slices(H, W, k)
+    K = len(slices)
     delta = (x - b)
 
-    def reveal_value(cell_ids):
-        field = torch.zeros((1, 1, H, W), dtype=x.dtype, device=x.device)
-        for cid in cell_ids:
-            rs, cs = slices[cid]
-            field[..., rs, cs] = 1.0
-        X = b + field * delta
+    # map each grid cell to a (H,W) boolean; precompute cell centroids? no --
+    # assign a node's pixels to cells by majority overlap.
+    cell_of_pixel = -np.ones((H, W), dtype=np.int64)
+    for idx, (rs, cs) in enumerate(slices):
+        cell_of_pixel[rs, cs] = idx
+
+    # leaves under a node (cached)
+    cache = {}
+    def leaves_under(nid):
+        if nid in cache:
+            return cache[nid]
+        n = by_id[nid]
+        s = [nid] if n["is_leaf"] else []
+        for c in n["child_ids"]:
+            s += leaves_under(c)
+        cache[nid] = s
+        return s
+
+    def node_mask(nid):
+        m = np.zeros((H, W), dtype=bool)
+        for lid in leaves_under(nid):
+            m |= leaf_masks[lid]
+        return m
+
+    def node_cells(mask):
+        # cells whose pixels are (mostly) inside the node's mask
+        cells = []
+        for idx, (rs, cs) in enumerate(slices):
+            tile = mask[rs, cs]
+            if tile.mean() > 0.5:          # majority of the cell is in the region
+                cells.append(idx)
+        return cells
+
+    def reveal_value(mask):
+        m = torch.as_tensor(mask, dtype=x.dtype, device=x.device).view(1, 1, H, W)
+        X = b + m * delta
         with torch.no_grad():
             p = F.softmax(model(X), dim=1)[0, target].item()
         return float(p)
@@ -170,28 +226,34 @@ def hessian_delta_faithfulness(
     with torch.no_grad():
         f_b = F.softmax(model(b), dim=1)[0, target].item()
 
-    rng = np.random.default_rng(seed)
-    K = len(slices)
-    pairs = set()
-    while len(pairs) < min(n_pairs, K * (K - 1) // 2):
-        i, j = rng.integers(0, K, size=2)
-        if i != j:
-            pairs.add((min(i, j), max(i, j)))
+    internals = [n for n in tree if not n["is_leaf"]]
+    # prefer larger-|delta| nodes (more interaction to test), cap for cost
+    sample = sorted(internals, key=lambda n: abs(n["delta"]), reverse=True)
+    sample = sample[:min(n_regions, len(sample))]
 
     add_err, int_err = [], []
-    for (i, j) in pairs:
-        vi = reveal_value([i]) - f_b
-        vj = reveal_value([j]) - f_b
-        vij = reveal_value([i, j]) - f_b
-        v_add = vi + vj
-        v_int = vi + vj + I[i, j]
-        add_err.append(abs(vij - v_add))
-        int_err.append(abs(vij - v_int))
+    for n in sample:
+        mask = node_mask(n["id"])
+        cells = node_cells(mask)
+        if len(cells) < 2:
+            continue
+        v_meas = reveal_value(mask) - f_b
+        v_add = float(sum(I[c, c] for c in cells))
+        pair_sum = 0.0
+        for a_i in range(len(cells)):
+            for b_i in range(a_i + 1, len(cells)):
+                pair_sum += 2.0 * I[cells[a_i], cells[b_i]]
+        v_int = v_add + pair_sum
+        add_err.append(abs(v_meas - v_add))
+        int_err.append(abs(v_meas - v_int))
+
+    if not add_err:
+        return {"skipped": "no multi-cell regions found", "n_regions": 0}
 
     add_err = np.array(add_err)
     int_err = np.array(int_err)
     return {
-        "n_pairs": int(len(pairs)),
+        "n_regions": int(len(add_err)),
         "mean_additive_error": float(add_err.mean()),
         "mean_interaction_error": float(int_err.mean()),
         "interaction_helps_fraction": float((int_err < add_err).mean()),
@@ -203,36 +265,98 @@ def hessian_delta_faithfulness(
 # combined verdict
 # --------------------------------------------------------------------------- #
 def verdict(agree_hess: dict, agree_pyr: dict,
-            dfaith_hess: dict, dfaith_pyr: dict) -> dict:
-    """Pick a winner per criterion + an overall call, with reasons."""
+            dfaith_hess: dict, dfaith_pyr: dict,
+            completeness_residual: float, completeness_rhs: float,
+            tol_frac: float = 0.10) -> dict:
+    """Adjudicate, but refuse to crown a winner on unreliable numbers.
+
+    GATE 0 -- Hessian validity. If interaction-completeness fails (residual not
+    small vs |f(x)-f(b)|), the integrated Hessian is under-resolved or the
+    smoothing is wrong; its matrix is not trustworthy and NO agreement/faithful
+    comparison is meaningful. We say so instead of comparing noise.
+    """
     reasons = []
 
-    # criterion A: prefer higher |r|, then higher sign agreement
-    a_h = (abs(agree_hess["offdiag_pearson_r"]),
-           agree_hess["offdiag_sign_agreement"])
-    a_p = (abs(agree_pyr["offdiag_pearson_r"]),
-           agree_pyr["offdiag_sign_agreement"])
-    winner_A = "hessian_ig" if a_h >= a_p else "pyramid"
+    rhs_scale = abs(completeness_rhs) + 1e-9
+    completeness_ok = abs(completeness_residual) <= tol_frac * rhs_scale
     reasons.append(
-        f"agreement: hessian r={agree_hess['offdiag_pearson_r']:+.3f} "
-        f"sign={agree_hess['offdiag_sign_agreement']:.2f} vs "
-        f"pyramid r={agree_pyr['offdiag_pearson_r']:+.3f} "
-        f"sign={agree_pyr['offdiag_sign_agreement']:.2f} -> {winner_A}"
+        f"interaction-completeness: residual={completeness_residual:+.4f} "
+        f"vs |f(x)-f(b)|={rhs_scale:.4f} "
+        f"({'OK' if completeness_ok else 'FAILED -> Hessian unreliable'})"
     )
+    if not completeness_ok:
+        return {
+            "winner_agreement": "unreliable (completeness failed)",
+            "winner_delta_faithfulness": "see below",
+            "overall": "Hessian-IG not validated; increase hess_steps or lower "
+                       "softplus_beta before comparing",
+            "reasons": reasons,
+        }
 
-    # criterion B: prefer larger relative error reduction (add - int)/add
+    # criterion A: agreement vs model-actual. Only meaningful where applicable.
+    if not agree_hess.get("applicable", False):
+        winner_A = "neither (no off-diagonal claims)"
+        reasons.append("agreement: hessian makes no off-diagonal claim -> N/A")
+    elif not agree_pyr.get("applicable", False):
+        # hessian makes pairwise claims, pyramid (by construction) does not.
+        # Score hessian on its own merits: does it POSITIVELY track the actual?
+        r = agree_hess["offdiag_pearson_r"]
+        sign = agree_hess["offdiag_sign_agreement"]
+        mr = agree_hess["offdiag_mass_ratio"]
+        good = (r > 0.2) and (sign > 0.6) and (0.3 < mr < 3.0)
+        winner_A = "hessian_ig" if good else "neither (hessian tracks actual poorly)"
+        reasons.append(
+            f"agreement: pyramid N/A (diagonal by construction); hessian "
+            f"r={r:+.3f} sign={sign:.2f} mass_ratio={mr:.2f} -> "
+            f"{'tracks actual' if good else 'does NOT track actual'}"
+        )
+    else:
+        a_h = (agree_hess["offdiag_pearson_r"], agree_hess["offdiag_sign_agreement"])
+        a_p = (agree_pyr["offdiag_pearson_r"], agree_pyr["offdiag_sign_agreement"])
+        winner_A = "hessian_ig" if a_h >= a_p else "pyramid"
+        reasons.append(
+            f"agreement: hessian r={a_h[0]:+.3f}/sign={a_h[1]:.2f} vs "
+            f"pyramid r={a_p[0]:+.3f}/sign={a_p[1]:.2f} -> {winner_A}"
+        )
+
+    # criterion B: relative error reduction, guarded against tiny baselines.
     def red(d):
+        if d.get("skipped"):
+            return None
         a = d.get("mean_additive_error", 0.0)
         i = d.get("mean_interaction_error", 0.0)
-        return (a - i) / a if a > 1e-12 else 0.0
+        if a < 1e-6:               # additive already exact -> reduction undefined
+            return None
+        return (a - i) / a
     r_h, r_p = red(dfaith_hess), red(dfaith_pyr)
-    winner_B = "hessian_ig" if r_h >= r_p else "pyramid"
-    reasons.append(
-        f"delta-faithfulness error reduction: hessian {r_h:+.2%} vs "
-        f"pyramid {r_p:+.2%} -> {winner_B}"
-    )
 
-    overall = winner_A if winner_A == winner_B else "split (see criteria)"
+    if r_h is None and r_p is None:
+        winner_B = "neither (additive baseline already exact / no regions)"
+        reasons.append("delta-faithfulness: undefined (additive error ~0) -> N/A")
+    elif r_h is None:
+        winner_B = "pyramid"
+        reasons.append(f"delta-faithfulness: hessian undefined; pyramid {r_p:+.2%}")
+    elif r_p is None:
+        winner_B = "hessian_ig" if r_h > 0 else "neither"
+        reasons.append(f"delta-faithfulness: pyramid undefined; hessian {r_h:+.2%}")
+    else:
+        winner_B = "hessian_ig" if r_h >= r_p else "pyramid"
+        reasons.append(
+            f"delta-faithfulness reduction: hessian {r_h:+.2%} vs "
+            f"pyramid {r_p:+.2%} -> {winner_B}"
+        )
+
+    # overall: only a clean winner if both real criteria agree on a real method
+    real = {"hessian_ig", "pyramid"}
+    if winner_A in real and winner_A == winner_B:
+        overall = winner_A
+    elif winner_A in real and winner_B not in real:
+        overall = f"{winner_A} (on agreement; faithfulness inconclusive)"
+    elif winner_B in real and winner_A not in real:
+        overall = f"{winner_B} (on faithfulness; agreement inconclusive)"
+    else:
+        overall = "inconclusive / different estimands (see criteria)"
+
     return {"winner_agreement": winner_A,
             "winner_delta_faithfulness": winner_B,
             "overall": overall,

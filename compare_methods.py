@@ -66,9 +66,11 @@ def main():
     ap.add_argument("--exact-hessian", action="store_true",
                     help="use exact full Hessian (slow); default is fast Hutchinson")  # [NEW]
     ap.add_argument("--n-probes", type=int, default=16,
-                    help="Hutchinson probes/step in fast mode")  # [NEW]
-    ap.add_argument("--verdict-pairs", type=int, default=24,
-                    help="random cell pairs for Hessian delta-faithfulness")  # [NEW]
+                    help="Hutchinson probes/point in fast mode")  # [NEW]
+    ap.add_argument("--softplus-beta", type=float, default=10.0,
+                    help="SoftPlus sharpness for 2nd-order smoothing of ReLU")  # [NEW]
+    ap.add_argument("--verdict-regions", type=int, default=40,
+                    help="pyramid tree nodes used as reveal regions in the verdict")  # [NEW]
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -93,6 +95,7 @@ def main():
         "hessian_ig": HessianIGExplainer(model, target_class=target, device=device,  # [NEW]
                                          class_names=names, sigma=args.sigma,
                                          k=args.k, hess_steps=args.hess_steps,
+                                         softplus_beta=args.softplus_beta,
                                          fast=not args.exact_hessian,
                                          n_probes=args.n_probes),
     }
@@ -169,22 +172,34 @@ def main():
     agree_hess = HV.agreement_scores(I_hess, I_actual)
     agree_pyr = HV.agreement_scores(P_pyr, I_actual)
 
-    # criterion B: delta-faithfulness
+    # criterion B: delta-faithfulness on pyramid tree nodes (shared regions)
     dfaith_hess = HV.hessian_delta_faithfulness(
-        hess, model, x, b, target, k=args.k, n_pairs=args.verdict_pairs)
+        hess, pyr, model, x, b, target, k=args.k, n_regions=args.verdict_regions)
     dfaith_pyr = inter["delta_faithfulness"]  # pyramid's tree-native version
 
-    verdict = HV.verdict(agree_hess, agree_pyr, dfaith_hess, dfaith_pyr)
+    verdict = HV.verdict(
+        agree_hess, agree_pyr, dfaith_hess, dfaith_pyr,
+        completeness_residual=hess.extras["completeness_residual"],
+        completeness_rhs=hess.extras["completeness_rhs"],
+    )
 
     HV.plot_three_matrices(I_actual, I_hess, P_pyr, args.k,
                            os.path.join(args.out, "second_order_matrices.png"))
 
     verdict_blob = {
         "grid_k": args.k,
+        "hessian_completeness": {
+            "lhs_sum_gamma": hess.extras["completeness_lhs"],
+            "rhs_fx_minus_fb": hess.extras["completeness_rhs"],
+            "residual": hess.extras["completeness_residual"],
+            "softplus_beta": hess.extras["softplus_beta"],
+            "n_relu_swapped": hess.extras["n_relu_swapped"],
+        },
         "agreement_vs_actual": {"hessian_ig": agree_hess, "pyramid": agree_pyr},
         "delta_faithfulness": {"hessian_ig": dfaith_hess, "pyramid": dfaith_pyr},
         "hessian_query_cost": {"n_forward": hess.extras["n_forward"],
-                               "n_backward": hess.extras["n_backward"]},
+                               "n_backward": hess.extras["n_backward"],
+                               "mode": hess.extras["mode"]},
         "verdict": verdict,
     }
     with open(os.path.join(args.out, "verdict.json"), "w") as fh:
@@ -224,28 +239,53 @@ def main():
             f"    mean |measured - interaction| : {df['mean_measured_vs_interaction']:.4f}",
         ]
     # ---- [NEW] verdict block ---------------------------------------------- #
+    def fmt(v, spec=".3f"):
+        try:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                return "   N/A"
+            return format(v, spec)
+        except (TypeError, ValueError):
+            return str(v)
+
+    ce = hess.extras
     lines += [
         "",
         "=" * 64,
         "VERDICT  --  Hessian-IG vs pyramid (second order, same k x k grid)",
         "=" * 64,
         "",
+        "0) HESSIAN VALIDITY -- interaction-completeness (sum_ij Gamma = f(x)-f(b)):",
+        f"     sum Gamma = {fmt(ce['completeness_lhs'], '.4f')}   "
+        f"f(x)-f(b) [softplus] = {fmt(ce['completeness_rhs'], '.4f')}   "
+        f"residual = {fmt(ce['completeness_residual'], '+.4f')}",
+        f"     softplus_beta={ce['softplus_beta']}  relus_swapped={ce['n_relu_swapped']}"
+        + ("  [if residual large: raise --hess-steps or lower --softplus-beta]"),
+        "",
         "A) AGREEMENT with model-actual pairwise matrix (off-diagonal):",
         f"  {'metric':>22} {'hessian_ig':>12} {'pyramid':>12}",
-        f"  {'pearson r':>22} {agree_hess['offdiag_pearson_r']:>12.3f} "
-        f"{agree_pyr['offdiag_pearson_r']:>12.3f}",
-        f"  {'sign agreement':>22} {agree_hess['offdiag_sign_agreement']:>12.2f} "
-        f"{agree_pyr['offdiag_sign_agreement']:>12.2f}",
-        f"  {'off-diag mass ratio':>22} {agree_hess['offdiag_mass_ratio']:>12.3f} "
-        f"{agree_pyr['offdiag_mass_ratio']:>12.3f}",
-        "  (pyramid lands on the diagonal by construction -> low off-diag r is",
-        "   expected; it asserts no specific cell-pair, like LIME.)",
+        f"  {'applicable':>22} {str(agree_hess['applicable']):>12} "
+        f"{str(agree_pyr['applicable']):>12}",
+        f"  {'pearson r':>22} {fmt(agree_hess['offdiag_pearson_r']):>12} "
+        f"{fmt(agree_pyr['offdiag_pearson_r']):>12}",
+        f"  {'sign agreement':>22} {fmt(agree_hess['offdiag_sign_agreement'], '.2f'):>12} "
+        f"{fmt(agree_pyr['offdiag_sign_agreement'], '.2f'):>12}",
+        f"  {'off-diag mass ratio':>22} {fmt(agree_hess['offdiag_mass_ratio']):>12} "
+        f"{fmt(agree_pyr['offdiag_mass_ratio']):>12}",
+        "  (pyramid is diagonal by construction -> N/A on off-diagonal; it makes",
+        "   no pairwise claim, so it is neither scored nor penalized here.)",
         "",
-        "B) DELTA-FAITHFULNESS (does the interaction term beat pure additive?):",
-        f"  hessian-IG: add-err {dfaith_hess['mean_additive_error']:.4f} -> "
-        f"int-err {dfaith_hess['mean_interaction_error']:.4f}  "
-        f"(helps on {dfaith_hess['interaction_helps_fraction']:.0%} of {dfaith_hess['n_pairs']} pairs)",
-        f"  pyramid   : add-err {df['mean_additive_error']:.4f} -> "
+        "B) DELTA-FAITHFULNESS (interaction term vs additive, on pyramid regions):",
+    ]
+    if dfaith_hess.get("skipped"):
+        lines.append(f"  hessian-IG: skipped ({dfaith_hess['skipped']})")
+    else:
+        lines.append(
+            f"  hessian-IG: add-err {fmt(dfaith_hess['mean_additive_error'], '.4f')} -> "
+            f"int-err {fmt(dfaith_hess['mean_interaction_error'], '.4f')}  "
+            f"(helps on {dfaith_hess['interaction_helps_fraction']:.0%} of "
+            f"{dfaith_hess['n_regions']} regions)")
+    lines += [
+        f"  pyramid   : add-err {fmt(df['mean_additive_error'], '.4f')} -> "
         f"int-err {df['mean_interaction_error']:.2e}  (telescoping identity)",
         "",
         f"  winner (agreement)          : {verdict['winner_agreement']}",
@@ -260,13 +300,13 @@ def main():
         "",
         "COST:",
         f"  pyramid forward passes   = {inter['pyramid_query_cost']}",
-        f"  hessian-IG mode          = {hess.extras['mode']}"
-        + (f" (n_probes={hess.extras['n_probes']})" if hess.extras['mode'] == 'fast_hutchinson' else ""),
-        f"  hessian-IG forward       = {hess.extras['n_forward']}",
-        f"  hessian-IG backward      = {hess.extras['n_backward']} "
-        + (f"(n_probes backward/step x hess_steps; K={args.k*args.k})"
-           if hess.extras['mode'] == 'fast_hutchinson'
-           else f"(K backward/step x hess_steps; K={args.k*args.k})"),
+        f"  hessian-IG mode          = {ce['mode']}"
+        + (f" (n_probes={ce['n_probes']})" if ce['mode'] == 'fast_hutchinson' else ""),
+        f"  hessian-IG forward       = {ce['n_forward']}",
+        f"  hessian-IG backward      = {ce['n_backward']} "
+        + (f"(~n_probes/point x hess_steps^2; K={args.k*args.k})"
+           if ce['mode'] == 'fast_hutchinson'
+           else f"(K/point x hess_steps^2; K={args.k*args.k})"),
     ]
     txt = "\n".join(lines) + "\n"
     with open(os.path.join(args.out, "summary.txt"), "w") as fh:
