@@ -290,6 +290,8 @@ class PyramidExplainer(Explainer):
                 split(c)
 
         split(root)
+        leaf_masks = {leaf.id: leaf.mask for leaf in leaves}   # <-- add
+
 
         sum_leaf_v = float(sum(l.v for l in leaves))
         sum_delta = float(sum(r.delta for r in internals))
@@ -352,6 +354,7 @@ class PyramidExplainer(Explainer):
                 "identity_rhs": identity_rhs,
                 "identity_residual": identity_residual,  # telescoping check ~0
                 "tree": all_serialized,                  # full v/Delta per node
+                "leaf_masks": leaf_masks,                        # <-- add
                 "reference": "blur_completion",
             },
         )
