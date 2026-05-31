@@ -1,60 +1,51 @@
-"""PyramidExplainer -- objective-driven, model-aware hierarchical attribution.
+"""PyramidExplainer -- model-aware agglomerative hierarchical residuals.
 
-Implements a region tree built by *solving* an early-value objective, rather
-than by a model-blind color heuristic. See method note for the theory; the
-short version:
+The region tree is built bottom-up by *merging the adjacent region pair the
+model treats as most non-additive*, rather than by a model-blind color
+heuristic or a fixed leaf-by-leaf growth chain. Construction and explanation
+use the same quantity: we merge on the merge residual Delta and we report it.
 
-Objective (early-value)
------------------------
-Choose a growth ordering of the foreground  S_0 = {} subset S_1 subset ... = root
-(each step adds one adjacency-connected leaf) maximizing
+Merge criterion (set by `merge_criterion`)
+------------------------------------------
+At each step, over adjacent pairs (Ri, Rj) of the current active regions:
 
-    J(T) = sum_{t=1..n} v(S_t)
-         = sum_{s=1..n} (n - s + 1) * g_s ,   g_s = v(S_s) - v(S_{s-1}).
+    Delta(Ri, Rj) = v(Ri u Rj) - v(Ri) - v(Rj)
 
-J is a decreasing-weighted sum of marginal gains: earlier merges get larger
-weights, so maximizing J front-loads model value into the first few merges.
+    - "max_coop": merge argmax Delta        (surface cooperation first)
+    - "max_both": merge argmax |Delta|      (surface cooperation AND
+                                             redundancy/suppression first)
 
-Algorithm (solves J under diminishing returns)
-----------------------------------------------
-Max-marginal-gain growth: at each step add the adjacent leaf of largest
-marginal gain g = v(S u {l}) - v(S). Under submodular v this greedy is the
-exact maximizer of J (gains come out sorted decreasing; weights (n-s+1) are
-decreasing; rearrangement inequality). Under connectivity it is a bounded
-approximation, and the merge residuals Delta(R) reported below *are* the
-measured submodularity-gap, i.e. the violations of the optimality premise.
+v(Ri), v(Rj) are cached; only v(Ri u Rj) costs a fresh forward. The winning
+pair fuses into a binary internal node; its value is the union value just
+computed and its stored residual is the winning Delta. After n-1 merges the
+single remaining region is the root. Children at every node disjointly
+partition the parent, so Theorem 1 (telescoping) holds unchanged:
 
-Sufficiency node
-----------------
-The smallest foreground set S_{t*} with v(S_{t*}) >= (1 - eps) * v(root),
-located at the knee of the cumulative-value curve. This is the "small part of
-the image that already explains the model"; residual on the path S_{t*}->root
-is v(root) - v(S_{t*}) ~ eps * v(root).
+    v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
 
-Core construction (unchanged identities)
-----------------------------------------
-1. Segment the image into superpixels (leaves).
-2. Build the region tree by foreground growth (above) + cheap color
-   agglomeration of the remaining background.
-3. Holistic on-manifold value:
-       Phi_R(x) = reveal R sharp, replace complement with blur_sigma(x)
-       v(R)     = f(Phi_R(x)) - f(x0)            with x0 = full blur reference b
-4. Merge residual for internal node R with children c_1..c_m:
-       Delta(R) = v(R) - sum_j v(c_j)
-5. Telescoping identity:
-       v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
+Cost
+----
+Heap-cached agglomeration: each merge only introduces fresh pairs between the
+new node and its neighbours (planar adjacency, avg degree small), so the total
+*fresh* forward count is ~ n (leaf values) + sum of new-neighbour counts
+~= O(n) in practice, not O(n^2). `frontier_k` caps pairs scored per step.
 
-Per-pixel attribution is the leaf-additive density v(leaf)/area(leaf), exactly
-as before; interaction (Delta) and the sufficiency node are reported in
-`extras` since they are tree-relative, not per-pixel.
+Caveat (mandatory experiment, not optional)
+--------------------------------------------
+The tree is now model-aware and can flatter the model: a tree built to surface
+cooperation will show cooperation. Random-tree and color-tree controls are
+REQUIRED to demonstrate that the residual structure is a property of the model,
+not of a flattering hierarchy. Reference (Phi, blur sigma) and query counts are
+logged, not hidden.
 
-Reference dependence (Phi, tree) is logged, not hidden. Because the tree is now
-model-aware, random-tree / color-tree controls are required to show that a
-small sufficient region is a property of the model, not of a flattering tree.
+Per-pixel attribution remains the leaf-additive density v(leaf)/area(leaf);
+Delta and the sufficiency node are reported in `extras` (tree-relative).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import heapq
+import itertools
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -83,9 +74,9 @@ class _Node:
     """One region in the region tree."""
     id: int
     mask: np.ndarray            # (H,W) bool, pixels belonging to this region
-    children: list             # list[_Node]; empty for leaves
-    v: float = 0.0             # holistic on-manifold value f(Phi_R(x)) - f(x0)
-    delta: float = 0.0         # merge residual v(R) - sum_j v(child_j); 0 for leaves
+    children: list              # list[_Node]; empty for leaves
+    v: float = 0.0              # holistic on-manifold value f(Phi_R(x)) - f(x0)
+    delta: float = 0.0          # merge residual v(R) - sum_j v(child_j); 0 for leaves
 
     @property
     def is_leaf(self) -> bool:
@@ -102,23 +93,25 @@ class PyramidExplainer(Explainer):
     def __init__(
         self,
         *args,
-        sigma: float = 11.0,         # blur strength for Phi complement (on-manifold)
-        n_segments: int = 144,        # target number of leaf superpixels (SLIC)
-        compactness: float = 2,       # SLIC compactness
-        max_nodes: Optional[int] = None,  # unused; kept for API parity
-        frontier_k: Optional[int] = None,  # cap candidates scored per growth step
-        suff_eps: float = 0.05,       # sufficiency: v(S) >= (1-eps) v(root)
-        knee: bool = True,            # locate sufficiency node at curve knee
+        sigma: float = 11.0,              # blur strength for Phi complement
+        n_segments: int = 144,            # target number of leaf superpixels (SLIC)
+        compactness: float = 2,           # SLIC compactness
+        merge_criterion: str = "max_coop",  # "max_coop" (Delta) or "max_both" (|Delta|)
+        frontier_k: Optional[int] = None,   # cap candidate pairs scored per step
+        suff_eps: float = 0.05,           # sufficiency: v(S) >= (1-eps) v(root)
         **kw,
     ):
         super().__init__(*args, **kw)
+        if merge_criterion not in ("max_coop", "max_both"):
+            raise ValueError(
+                f"merge_criterion must be 'max_coop' or 'max_both', got {merge_criterion!r}"
+            )
         self.sigma = sigma
         self.n_segments = n_segments
         self.compactness = compactness
-        self.max_nodes = max_nodes
+        self.merge_criterion = merge_criterion
         self.frontier_k = frontier_k
         self.suff_eps = suff_eps
-        self.knee = knee
 
     # ------------------------------------------------------------------ #
     # Phi: blur-completion manifold-projection operator
@@ -167,7 +160,6 @@ class PyramidExplainer(Explainer):
     # ------------------------------------------------------------------ #
     def _leaf_adjacency(self, labels: np.ndarray) -> dict[int, set]:
         """Return {leaf_label: set(neighbour leaf_labels)} via 4-connectivity."""
-        H, W = labels.shape
         adj: dict[int, set] = {int(l): set() for l in np.unique(labels)}
         a, b_ = labels[:, :-1], labels[:, 1:]
         diff = a != b_
@@ -182,152 +174,193 @@ class PyramidExplainer(Explainer):
         return adj
 
     # ------------------------------------------------------------------ #
-    # region tree by SOLVING the early-value objective J
+    # priority key for the merge criterion
+    # ------------------------------------------------------------------ #
+    def _merge_key(self, delta: float) -> float:
+        """Higher key == merge sooner. heapq is a min-heap, so we negate."""
+        if self.merge_criterion == "max_coop":
+            return delta          # most positive cooperation first
+        else:  # max_both
+            return abs(delta)     # strongest |non-additivity| (coop OR suppression)
+
+    # ------------------------------------------------------------------ #
+    # region tree by model-aware agglomerative merging
     # ------------------------------------------------------------------ #
     def _build_tree(self, img01, labels, x, b, x0_val: float, target: int):
-        """Foreground grown by max-marginal-gain (maximizes J under submodular v),
-        background closed cheaply by color, joined at the root.
+        """Bottom-up agglomeration: repeatedly fuse the adjacent active-region
+        pair with the largest merge key (Delta or |Delta|).
 
-        Returns (root, info) where info carries construction diagnostics:
-        growth ordering, marginal gains, cumulative values, sufficiency node id,
-        and the number of model queries spent on construction.
+        Returns (root, info) with construction diagnostics: merge order, the
+        residual realised at each merge, and fresh forward-query count.
+
+        Heap-caching: a candidate pair's Delta is valid until one of its two
+        regions is consumed by a merge. We push (-key, tiebreak, ida, idb,
+        delta, v_union) entries and lazily skip stale ones (regions no longer
+        active). After each merge only the new node's pairs are scored.
         """
-        H, W = labels.shape
         uniq = [int(l) for l in np.unique(labels)]
         n = len(uniq)
 
-        # Leaf nodes + per-leaf masks / mean colors.
         leaf_mask = {l: (labels == l) for l in uniq}
         leaf_color = {l: img01[leaf_mask[l]].mean(axis=0) for l in uniq}
         leaf_adj = self._leaf_adjacency(labels)
 
-        # Leaf values v({l}) -- needed for seeding and reported regardless.
-        # These also count as construction queries.
-        n_constr_q = 0
+        n_fresh_q = 0  # fresh model forwards spent in construction
+
+        # ---- node registry -------------------------------------------- #
+        node: dict[int, _Node] = {}
+        next_id = 0
+
+        # Leaf nodes (ids 0..n-1). Leaf value v({l}) = one forward each.
+        leaf_node: dict[int, _Node] = {}
         leaf_value: dict[int, float] = {}
         for l in uniq:
             leaf_value[l] = self._value_of_mask(leaf_mask[l], x, b, x0_val, target)
-            n_constr_q += 1
-
-        # ---- Phase B: grow the foreground by max-marginal-gain ---------- #
-        # Seed from the single highest-value leaf (argmax v({l})).
-        seed = max(uniq, key=lambda l: leaf_value[l])
-
-        in_fg = {seed}
-        S_mask = leaf_mask[seed].copy()
-        v_S = leaf_value[seed]                       # v(S_1); reuse leaf query
-        # Growth records (S_1 = {seed}).
-        order = [seed]
-        gains = [v_S - 0.0]                          # g_1 = v(S_1) - v(empty)=v(S_1)
-        cum_v = [v_S]                                # v(S_1)
-
-        # Frontier = leaves adjacent to current foreground, not yet absorbed.
-        def frontier(members: set) -> set:
-            fr = set()
-            for m in members:
-                fr |= leaf_adj[m]
-            return fr - members
-
-        fr = frontier(in_fg)
-
-        # Greedy growth until every leaf is absorbed.
-        while len(in_fg) < n:
-            if not fr:
-                # Disconnected remainder (rare): absorb the global best leftover
-                # by value so growth can continue without spurious queries.
-                leftover = [l for l in uniq if l not in in_fg]
-                cand = leftover
-            else:
-                cand = list(fr)
-
-            # Optionally cap the number of model-scored candidates per step,
-            # pre-ranking the frontier by leaf value (cheap, model-aware proxy).
-            if self.frontier_k is not None and len(cand) > self.frontier_k:
-                cand = sorted(cand, key=lambda l: leaf_value[l], reverse=True)
-                cand = cand[: self.frontier_k]
-
-            # Score each candidate by marginal gain g = v(S u {l}) - v(S).
-            best_l, best_gain, best_v = None, None, None
-            for l in cand:
-                trial_mask = S_mask | leaf_mask[l]
-                v_trial = self._value_of_mask(trial_mask, x, b, x0_val, target)
-                n_constr_q += 1
-                g = v_trial - v_S
-                if best_gain is None or g > best_gain:
-                    best_l, best_gain, best_v = l, g, v_trial
-
-            # Commit the best candidate.
-            in_fg.add(best_l)
-            S_mask = S_mask | leaf_mask[best_l]
-            v_S = best_v
-            order.append(best_l)
-            gains.append(best_gain)
-            cum_v.append(v_S)
-            fr = frontier(in_fg)
-
-        # ---- Sufficiency node t*: smallest S_t with v(S_t) >= (1-eps) v_root #
-        v_root_est = cum_v[-1]                       # v(S_n) = v(root) estimate
-        # eps-threshold index.
-        thresh = (1.0 - self.suff_eps) * v_root_est if v_root_est > 0 else v_root_est
-        t_eps = next((t for t, vv in enumerate(cum_v) if vv >= thresh), len(cum_v) - 1)
-
-        # Optional knee: largest drop in marginal gain (elbow of cum curve).
-        if self.knee and len(gains) > 2:
-            # knee = index just before the biggest relative gain drop.
-            drops = [gains[i] - gains[i + 1] for i in range(len(gains) - 1)]
-            t_knee = int(np.argmax(drops))           # S_{t_knee+1} seals the elbow
-            t_star = min(t_eps, t_knee + 1)
-        else:
-            t_star = t_eps
-        t_star = max(0, min(t_star, len(order) - 1))  # clamp to valid index
-
-        # ---- Assemble the tree from the growth chain ------------------- #
-        # Build the foreground backbone as a left-deep chain:
-        #   S_1, then merge(S_1, leaf_2)=S_2, ... = S_n = root.
-        # Each S_t internal node reuses the already-computed v(S_t)=cum_v[t].
-        next_id = 0
-        node: dict[int, _Node] = {}
-
-        # Leaf nodes first (stable ids 0..n-1 keyed by growth order for clarity).
-        leaf_node: dict[int, _Node] = {}
-        for l in uniq:
-            node[next_id] = _Node(id=next_id, mask=leaf_mask[l], children=[])
-            node[next_id].v = leaf_value[l]
-            leaf_node[l] = node[next_id]
+            n_fresh_q += 1
+            nd = _Node(id=next_id, mask=leaf_mask[l], children=[])
+            nd.v = leaf_value[l]
+            node[next_id] = nd
+            leaf_node[l] = nd
             next_id += 1
 
-        # Backbone: cluster_t is the internal node for S_t (t>=2).
-        cluster_mask = leaf_mask[order[0]].copy()
-        cluster_node = leaf_node[order[0]]           # S_1 == seed leaf
-        suff_node_id = cluster_node.id               # updated when we pass t*
-        for t in range(1, len(order)):
-            child_existing = cluster_node            # S_{t}
-            child_new = leaf_node[order[t]]          # newly added leaf
-            cluster_mask = cluster_mask | leaf_mask[order[t]]
+        # ---- active-region bookkeeping (keyed by node id) ------------- #
+        active: set = set(leaf_node[l].id for l in uniq)         # live region ids
+        nadj: dict[int, set] = {                                  # region adjacency
+            leaf_node[l].id: set(leaf_node[m].id for m in leaf_adj[l])
+            for l in uniq
+        }
+        # leaf-color per active region id (for cheap background tie-handling only)
+        rcolor: dict[int, np.ndarray] = {leaf_node[l].id: leaf_color[l] for l in uniq}
+
+        # ---- candidate-pair heap -------------------------------------- #
+        # entry: (negkey, tiebreak, ida, idb, delta, v_union)
+        heap: list = []
+        tiebreak = itertools.count()
+
+        def score_pair(ida: int, idb: int):
+            """Compute Delta for an active pair, push to heap. One forward."""
+            nonlocal n_fresh_q
+            na, nb = node[ida], node[idb]
+            union_mask = na.mask | nb.mask
+            v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
+            n_fresh_q += 1
+            delta = v_union - na.v - nb.v
+            key = self._merge_key(delta)
+            heapq.heappush(heap, (-key, next(tiebreak), ida, idb, delta, v_union))
+
+        # Optional frontier_k cap: rank a region's neighbours by a cheap
+        # model-aware proxy (current region value) and only score the top-k
+        # pairs for that region. Reduces forwards at the cost of approximating
+        # the global argmax.
+        def neighbours_to_score(rid: int) -> list:
+            cand = [m for m in nadj[rid] if m in active]
+            if self.frontier_k is not None and len(cand) > self.frontier_k:
+                cand = sorted(cand, key=lambda m: node[m].v, reverse=True)
+                cand = cand[: self.frontier_k]
+            return cand
+
+        # Seed the heap with every adjacent leaf pair (each pair once).
+        seeded: set = set()
+        for rid in list(active):
+            for m in neighbours_to_score(rid):
+                key2 = (min(rid, m), max(rid, m))
+                if key2 in seeded:
+                    continue
+                seeded.add(key2)
+                score_pair(key2[0], key2[1])
+
+        merge_order = []   # list of (child_a_id, child_b_id, merged_id, delta)
+        merge_deltas = []  # realised residual at each merge
+
+        # ---- agglomeration loop --------------------------------------- #
+        while len(active) > 1:
+            # Pop the best *still-valid* candidate.
+            best = None
+            while heap:
+                negkey, _, ida, idb, delta, v_union = heapq.heappop(heap)
+                if ida in active and idb in active:
+                    best = (ida, idb, delta, v_union)
+                    break
+                # else: stale (a region was consumed) -> discard
+
+            if best is None:
+                # Heap exhausted but >1 region remains: disconnected components
+                # (rare). Join the two cheapest-to-evaluate leftover regions by
+                # color proximity to finish the tree without spurious queries.
+                left = list(active)
+                # nearest color pair among leftovers
+                pa, pb, bestd = left[0], left[1], np.inf
+                for i in range(len(left)):
+                    for j in range(i + 1, len(left)):
+                        d = float(np.sum((rcolor[left[i]] - rcolor[left[j]]) ** 2))
+                        if d < bestd:
+                            bestd, pa, pb = d, left[i], left[j]
+                ida, idb = pa, pb
+                na, nb = node[ida], node[idb]
+                union_mask = na.mask | nb.mask
+                v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
+                n_fresh_q += 1
+                delta = v_union - na.v - nb.v
+                best = (ida, idb, delta, v_union)
+
+            ida, idb, delta, v_union = best
+            na, nb = node[ida], node[idb]
+
+            # Create the merged binary node; reuse v_union (no re-query).
             merged = _Node(
                 id=next_id,
-                mask=cluster_mask.copy(),
-                children=[child_existing, child_new],
+                mask=(na.mask | nb.mask),
+                children=[na, nb],
             )
-            merged.v = cum_v[t]                       # reuse construction value
+            merged.v = v_union
+            merged.delta = delta
             node[next_id] = merged
-            cluster_node = merged
-            if t == t_star:
-                suff_node_id = merged.id
+            mid = next_id
             next_id += 1
 
-        root = cluster_node                          # S_n covers the full frame
+            # Update active set and adjacency: merged inherits both neighbour
+            # sets (minus the two consumed regions).
+            active.discard(ida)
+            active.discard(idb)
+            new_neigh = (nadj[ida] | nadj[idb]) - {ida, idb}
+            new_neigh = {m for m in new_neigh if m in active}
+            nadj[mid] = new_neigh
+            for m in new_neigh:
+                nadj[m].discard(ida)
+                nadj[m].discard(idb)
+                nadj[m].add(mid)
+            active.add(mid)
+            # area-weighted mean color for the merged region (tie-handling only)
+            wa, wb = na.area, nb.area
+            rcolor[mid] = (rcolor[ida] * wa + rcolor[idb] * wb) / max(wa + wb, 1)
+
+            merge_order.append((ida, idb, mid, float(delta)))
+            merge_deltas.append(float(delta))
+
+            # Score the new node's pairs (only these are fresh).
+            for m in neighbours_to_score(mid):
+                score_pair(mid, m)
+
+        root = node[next(iter(active))]
+
+        # ---- sufficiency node: smallest-area node with v >= (1-eps)v_root #
+        # Walk all nodes; among those clearing the threshold pick min area.
+        v_root_est = root.v
+        thresh = (1.0 - self.suff_eps) * v_root_est if v_root_est > 0 else v_root_est
+        suff_node = root
+        suff_area = root.area
+        for nd in node.values():
+            if nd.v >= thresh and nd.area < suff_area:
+                suff_node, suff_area = nd, nd.area
 
         info = {
-            "order": order,                          # leaf labels in growth order
-            "gains": [float(g) for g in gains],      # marginal gains g_t
-            "cum_v": [float(c) for c in cum_v],      # v(S_t)
-            "t_star": int(t_star),                   # sufficiency index (0-based)
-            "suff_node_id": int(suff_node_id),
-            "v_suff": float(cum_v[t_star]),
+            "merge_order": merge_order,                 # (a,b,merged,delta) per step
+            "merge_deltas": merge_deltas,               # realised residual per merge
             "v_root_est": float(v_root_est),
-            "n_construction_queries": int(n_constr_q),
-            "objective_J": float(sum(cum_v)),        # J(T) = sum_t v(S_t)
+            "suff_node_id": int(suff_node.id),
+            "suff_v": float(suff_node.v),
+            "n_construction_queries": int(n_fresh_q),
+            "merge_criterion": self.merge_criterion,
         }
         return root, info
 
@@ -338,10 +371,11 @@ class PyramidExplainer(Explainer):
                         skip_if_present: bool = True):
         """Fill v(R) for every node, then Delta(R) for internal nodes.
 
-        Nodes built by _build_tree already carry v(R) from construction; with
-        skip_if_present we reuse those instead of re-querying the model, so the
-        2n-1 'evaluation' queries collapse into the construction queries. We
-        still report the number of *fresh* value queries spent here.
+        Nodes built by _build_tree already carry v(R) and Delta from
+        construction; with skip_if_present we reuse those instead of
+        re-querying, so the 2n-1 'evaluation' queries collapse into the
+        construction queries. Returns the number of *fresh* queries spent here
+        (normally 0).
         """
         all_nodes: list[_Node] = []
 
@@ -355,8 +389,7 @@ class PyramidExplainer(Explainer):
         n_queries = 0
         for nd in all_nodes:
             if skip_if_present and (nd.v != 0.0 or nd.is_leaf):
-                # value already set during construction (reused, no model call)
-                continue
+                continue  # value already set during construction (no model call)
             nd.v = self._value_of_mask(nd.mask, x, b, x0_val, target)
             n_queries += 1
 
@@ -379,19 +412,18 @@ class PyramidExplainer(Explainer):
         img01 = denormalize(x)[0].permute(1, 2, 0).cpu().numpy()  # (H,W,3) in [0,1]
         H, W = img01.shape[:2]
 
-        # f(x), f(x0) = f(b).
         f_x = self._target_prob(x, target)
-        f_b = self._target_prob(b, target)  # x0 = full-blur reveal of nothing
+        f_b = self._target_prob(b, target)   # x0 = full-blur reveal of nothing
         x0_val = f_b
 
-        # Build leaf segmentation, then SOLVE the early-value objective for the tree.
+        # Build leaf segmentation, then the model-aware agglomerative tree.
         labels = self._leaf_labels(img01)
         root, tinfo = self._build_tree(img01, labels, x, b, x0_val, target)
 
         # Fill v(R) and Delta(R) across the tree (reusing construction values).
         n_queries = self._compute_values(root, x, b, x0_val, target)
 
-        # --- completeness-style identity check (telescoping) ---------------- #
+        # --- telescoping identity check ------------------------------------- #
         leaves: list[_Node] = []
         internals: list[_Node] = []
 
@@ -405,11 +437,11 @@ class PyramidExplainer(Explainer):
 
         sum_leaf_v = float(sum(l.v for l in leaves))
         sum_delta = float(sum(r.delta for r in internals))
-        identity_lhs = float(root.v)                 # v(root)
-        identity_rhs = sum_leaf_v + sum_delta        # sum leaf v + sum Delta
+        identity_lhs = float(root.v)                  # v(root)
+        identity_rhs = sum_leaf_v + sum_delta         # sum leaf v + sum Delta
         identity_residual = identity_lhs - identity_rhs  # ~0 up to float error
 
-        # --- non-additivity index (diagnostic) ------------------------------ #
+        # --- non-additivity index ------------------------------------------- #
         denom = sum(abs(l.v) for l in leaves) + sum(abs(r.delta) for r in internals)
         nai = float(sum(abs(r.delta) for r in internals) / denom) if denom > 0 else 0.0
 
@@ -419,18 +451,16 @@ class PyramidExplainer(Explainer):
             area = max(leaf.area, 1)
             attr[leaf.mask] = leaf.v / area
 
-        # f_phi reported as the root reveal value (whole image sharp) for parity.
         f_phi = self._target_prob(self._phi(x, b, root.mask), target)
 
         # --- sufficiency diagnostics ---------------------------------------- #
         suff_id = tinfo["suff_node_id"]
         suff_node = next((nd for nd in (leaves + internals) if nd.id == suff_id), root)
         suff_area_frac = float(suff_node.area) / float(H * W)
-        resid_above_suff = float(root.v - suff_node.v)        # v(root) - v(S*)
+        resid_above_suff = float(root.v - suff_node.v)
         resid_above_frac = (resid_above_suff / root.v) if root.v != 0 else 0.0
 
-        # Serialize the tree (id, area, v, delta, child ids) for downstream
-        # interaction analysis -- residuals are tree-relative, not per-pixel.
+        # --- serialize the tree --------------------------------------------- #
         def serialize(n: _Node) -> dict:
             return {
                 "id": n.id,
@@ -463,7 +493,9 @@ class PyramidExplainer(Explainer):
                 "n_segments": self.n_segments,
                 "n_leaves": len(leaves),
                 "n_internal": len(internals),
-                "n_value_queries": n_queries,                  # fresh queries here
+                "merge_criterion": self.merge_criterion,
+                "frontier_k": self.frontier_k,
+                "n_value_queries": n_queries,                 # fresh queries here (~0)
                 "n_construction_queries": tinfo["n_construction_queries"],
                 "n_total_queries": n_queries + tinfo["n_construction_queries"],
                 "root_v": float(root.v),
@@ -471,24 +503,20 @@ class PyramidExplainer(Explainer):
                 "sum_delta": sum_delta,
                 "identity_lhs": identity_lhs,
                 "identity_rhs": identity_rhs,
-                "identity_residual": identity_residual,        # telescoping check ~0
-                "nai": nai,                                    # non-additivity index
-                # --- objective + sufficiency reporting ---
-                "objective_J": tinfo["objective_J"],           # J(T) = sum_t v(S_t)
-                "growth_order": tinfo["order"],
-                "growth_gains": tinfo["gains"],
-                "growth_cum_v": tinfo["cum_v"],
-                "t_star": tinfo["t_star"],
+                "identity_residual": identity_residual,       # telescoping check ~0
+                "nai": nai,                                   # non-additivity index
+                # --- merge / sufficiency reporting ---
+                "merge_order": tinfo["merge_order"],          # (a,b,merged,delta)
+                "merge_deltas": tinfo["merge_deltas"],        # residual per merge
                 "suff_node_id": suff_id,
-                "suff_n_leaves": int(tinfo["t_star"] + 1),
                 "suff_v": float(suff_node.v),
-                "suff_area_frac": suff_area_frac,              # area(S*)/area(image)
-                "resid_above_suff": resid_above_suff,          # v(root)-v(S*)
-                "resid_above_frac": resid_above_frac,          # as frac of v(root)
+                "suff_area_frac": suff_area_frac,             # area(S*)/area(image)
+                "resid_above_suff": resid_above_suff,         # v(root)-v(S*)
+                "resid_above_frac": resid_above_frac,         # as frac of v(root)
                 "suff_eps": self.suff_eps,
-                "tree": all_serialized,                        # full v/Delta per node
+                "tree": all_serialized,                       # full v/Delta per node
                 "leaf_masks": leaf_masks,
                 "reference": "blur_completion",
-                "merge_rule": "max_marginal_gain (solves early-value J)",
+                "merge_rule": f"agglomerative_{self.merge_criterion}",
             },
         )
