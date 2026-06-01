@@ -13,18 +13,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .base import AttributionResult, Explainer, blur_reference
+from .base import AttributionResult, Explainer, blur_reference, make_reference
 
 
 class LIMEExplainer(Explainer):
     name = "lime"
 
     def __init__(self, *args, grid=(12, 12), n_samples=1000, sigma=11.0,
+                 infill="blur", noise_std=0.25,
                  kernel_width=0.25, seed=0, batch_size=64, **kw):
         super().__init__(*args, **kw)
         self.grid = grid
         self.n_samples = n_samples
         self.sigma = sigma
+        self.infill = infill
+        self.noise_std = noise_std
         self.kernel_width = kernel_width
         self.seed = seed
         self.batch_size = batch_size
@@ -83,7 +86,7 @@ class LIMEExplainer(Explainer):
             target_class=target,
             target_class_name=self._class_name(target),
             f_x=float(self._probs(x)[0, target]),
-            extras={"grid": self.grid, "n_samples": self.n_samples},
+            extras={"grid": self.grid, "n_samples": self.n_samples, "infill": self.infill},
         )
 
 

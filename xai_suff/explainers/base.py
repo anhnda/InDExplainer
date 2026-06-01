@@ -63,17 +63,69 @@ def gaussian_blur(x: torch.Tensor, sigma: float) -> torch.Tensor:
     return x
 
 
-def blur_reference(x_norm: torch.Tensor, sigma: float = 100.0) -> torch.Tensor:
-    """Strong-blur self-reference of a *normalized* image.
+# def blur_reference(x_norm: torch.Tensor, sigma: float = 100.0) -> torch.Tensor:
+#     """Strong-blur self-reference of a *normalized* image.
 
-    Blurs in [0,1] pixel space (so color statistics stay physical) then
-    re-normalizes. Large sigma => destroys object high-frequency structure,
-    keeps low-frequency color/layout => approximately class-neutral, on-manifold.
+#     Blurs in [0,1] pixel space (so color statistics stay physical) then
+#     re-normalizes. Large sigma => destroys object high-frequency structure,
+#     keeps low-frequency color/layout => approximately class-neutral, on-manifold.
+#     """
+#     x01 = denormalize(x_norm)
+#     b01 = gaussian_blur(x01, sigma).clamp(0, 1)
+#     return normalize_pixel(b01)
+def blur_reference(x_norm: torch.Tensor, sigma: float = 100.0) -> torch.Tensor:
+    """Strong-blur self-reference of a *normalized* image (kept for back-compat)."""
+    return make_reference(x_norm, mode="blur", sigma=sigma)
+def make_reference(
+    x_norm: torch.Tensor,
+    mode: str = "blur",
+    sigma: float = 100.0,
+    noise_std: float = 0.25,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Build an infill reference for a *normalized* image.
+
+    Modes (all built in [0,1] pixel space, then re-normalized):
+      - "blur":   strong Gaussian self-blur (default; on-manifold, ~class-neutral)
+      - "black":  constant 0
+      - "white":  constant 1
+      - "noise":  per-pixel uniform noise in [0,1] (seeded)
+      - "corners": constant fill = mean color of the four corner pixels
     """
     x01 = denormalize(x_norm)
-    b01 = gaussian_blur(x01, sigma).clamp(0, 1)
-    return normalize_pixel(b01)
 
+    if mode == "blur":
+        b01 = gaussian_blur(x01, sigma).clamp(0, 1)
+    elif mode == "black":
+        b01 = torch.zeros_like(x01)
+    elif mode == "white":
+        b01 = torch.ones_like(x01)
+    elif mode == "noise":
+        gen = torch.Generator(device=x01.device).manual_seed(seed)
+        b01 = torch.rand(x01.shape, generator=gen, device=x01.device, dtype=x01.dtype)
+    elif mode == "corners":
+        # mean color over four 10%x10% corner patches, per channel -> (1,C,1,1) fill
+        H, W = x01.shape[-2:]
+        ph = max(1, int(round(0.10 * H)))
+        pw = max(1, int(round(0.10 * W)))
+        patches = torch.cat(
+            [
+                x01[..., :ph, :pw],     # top-left
+                x01[..., :ph, -pw:],    # top-right
+                x01[..., -ph:, :pw],    # bottom-left
+                x01[..., -ph:, -pw:],   # bottom-right
+            ],
+            dim=-1,
+        )  # (1,C,ph, 4*pw)
+        mean_c = patches.mean(dim=(-2, -1)).view(1, -1, 1, 1)  # (1,C,1,1)
+        b01 = mean_c.expand_as(x01).clamp(0, 1)
+    else:
+        raise ValueError(
+            f"unknown infill mode {mode!r}; "
+            "expected one of: blur, black, white, noise, corners"
+        )
+
+    return normalize_pixel(b01)
 
 class Explainer:
     """Base class. Subclasses implement `explain`."""
