@@ -7,7 +7,7 @@ joint-score steps:
 
     1. LIME pass on the leaves (SLIC superpixels or grid cells) gives one
        surrogate coefficient per leaf -> a ranked leaf list.
-    2. The top-`k_lime` LIME leaves (default k=2) are inserted FIRST, in LIME
+    2. The top-`k_lime` LIME leaves (default k=10) are inserted FIRST, in LIME
        rank order. These form S_1 c S_2 c ... c S_k as the chain seed.
     3. From S_k onward the chain grows by the original nested greedy-add-leaf
        rule on the joint reveal score:
@@ -19,24 +19,41 @@ This keeps the non-circularity of the original design (the accept criterion is a
 genuine model output, not the residual Delta) while letting a cheap surrogate
 warm-start the root of the chain.
 
+full_lime mode (ablation)
+-------------------------
+Setting `full_lime=True` makes the ENTIRE chain follow the LIME ranking: the
+greedy phase is skipped and the node order is EXACTLY the sorted LIME
+coefficients, end-to-end. This is the degenerate corner of the method (k_lime =
+n_leaves) and is meant as an ablation / control: it answers "what if we never
+used the model's joint score, only the surrogate rank?". Theorem 1 (telescoping)
+still holds, because the tree is still a disjoint nested partition -- only the
+ORDER in which leaves are absorbed changes. The merge residuals Delta are still
+computed from genuine joint reveals v(S), so the decomposition is unchanged; what
+changes is which coalitions the chain visits. Use it to bound how much the greedy
+joint-score steps add over a pure-LIME ordering on the same grid.
+
 Honesty note (read before trusting the tree)
 ---------------------------------------------
-With k=2 the structural commitment to LIME is small: only the two top LIME
+With small k_lime the structural commitment to LIME is small: only the top LIME
 leaves are forced; the rest of the tree is the model's own greedy ordering. The
 LIME-order control curve (built in pure LIME rank) is reported alongside the
 greedy curve so the LIME contribution can be checked directly -- if the greedy
 v(S_k) curve does not rise faster than the LIME-order curve, the model's joint
-score decisions are not doing real work beyond the surrogate.
+score decisions are not doing real work beyond the surrogate. In `full_lime`
+mode the chain and that control are by construction the same order.
 
 Selection signal
 ----------------
 Joint reveal score v(S) = f(Phi_S(x)) - f(x0), a genuine model output bounded
 above by v(root); NOT the merge residual Delta (building on Delta is circular).
+In `full_lime` mode the selection signal is the LIME coefficient, not v(S):
+nodes are ordered by the surrogate, and v(S) is only MEASURED, not used to pick.
 
 Construction (LIME-seeded nested greedy-add-leaf)
 -------------------------------------------------
     seed:  S_1..S_k  = top-k LIME-ranked leaves, in LIME order
     grow:  S_{j}     = S_{j-1} u {argmax_{l notin S_{j-1}} v(S_{j-1} u {l})}
+    full_lime: S_1..S_n = ALL leaves, in LIME order (grow phase never runs)
 
 Each step appends one leaf, creating one binary internal node (running-union +
 the newly added leaf). The chain S_1 c S_2 c ... c S_n is the trace from the
@@ -53,11 +70,13 @@ Optimality claim (honest)
 -------------------------
 The seed leaves are LIME-chosen, NOT joint-score-optimal; only the greedy phase
 is nested-greedy-best (exactly optimal iff v is monotone submodular, (1-1/e)
-otherwise). Each level is still certified by a 1-swap local-search audit: try
-replacing one in-set leaf with one out-of-set leaf; if no single swap raises v,
-S_k is a certified 1-swap local optimum. Swaps may break strict nesting, so the
-audit is reported separately and the telescoping tree is always built from the
-pure nested chain.
+otherwise). In `full_lime` mode NO part of the order is joint-score-optimal: the
+order is the surrogate's, so the optimality claim does not apply and the swap
+audit will typically find improving swaps. Each level is otherwise certified by a
+1-swap local-search audit: try replacing one in-set leaf with one out-of-set
+leaf; if no single swap raises v, S_k is a certified 1-swap local optimum. Swaps
+may break strict nesting, so the audit is reported separately and the telescoping
+tree is always built from the pure nested chain.
 
 Controls (mandatory, not optional)
 ----------------------------------
@@ -121,6 +140,8 @@ class PyramidExplainer(Explainer):
         value_mode: str = "prob",        # "logit" (paper Def 3) or "prob"
         # --- LIME prior ------------------------------------------------- #
         k_lime: int = 10,                  # number of top-LIME leaves used to seed S
+        full_lime: bool = False,          # if True: ENTIRE chain follows LIME rank,
+                                          # greedy phase skipped (ablation/control)
         lime_n_samples: int = 1000,       # LIME perturbation samples
         lime_kernel_width: float = 0.25,  # LIME locality kernel width
         lime_alpha: float = 1.0,          # LIME ridge regularization
@@ -146,6 +167,7 @@ class PyramidExplainer(Explainer):
         self.grid = grid
         self.value_mode = value_mode
         self.k_lime = int(k_lime)
+        self.full_lime = bool(full_lime)
         self.lime_n_samples = lime_n_samples
         self.lime_kernel_width = lime_kernel_width
         self.lime_alpha = lime_alpha
@@ -277,6 +299,9 @@ class PyramidExplainer(Explainer):
     def _build_tree(self, img01, labels, x, b, x0_val: float, target: int):
         """Grow one nested coalition: seed with the top-`k_lime` LIME leaves (in
         LIME order), then greedily add the leaf that most increases v(S u {l}).
+
+        If `self.full_lime` is True the seed covers EVERY leaf, so the greedy
+        phase never runs and the chain order is exactly the LIME ranking.
         Returns (root, info).
         """
         uniq = [int(l) for l in np.unique(labels)]
@@ -307,12 +332,19 @@ class PyramidExplainer(Explainer):
         chain_v = []                            # v(S_k) after each inclusion
         chain_delta = []                        # Delta at each merge (0 for S_1)
         chain_node_ids = []                     # running-union node id per level
-        chain_source = []                       # "lime_seed" or "greedy" per level
+        chain_source = []                       # "lime_seed" / "lime_full" / "greedy"
         merge_order = []                        # (running_id, leaf_id, merged_id, delta)
         in_set: set = set()
 
         # ---- seed phase: top-k LIME leaves, in LIME rank order -------- #
-        k_seed = max(1, min(self.k_lime, len(uniq)))
+        # full_lime: the "seed" is the entire LIME ranking, so the chain order
+        # IS the sorted LIME coefficients and the greedy loop below is a no-op.
+        if self.full_lime:
+            k_seed = len(uniq)
+            seed_source = "lime_full"
+        else:
+            k_seed = max(1, min(self.k_lime, len(uniq)))
+            seed_source = "lime_seed"
         seed_leaves = lime_ranked[:k_seed]
 
         cur_node = None
@@ -329,7 +361,7 @@ class PyramidExplainer(Explainer):
                 chain_v.append(cur_v)
                 chain_delta.append(0.0)
                 chain_node_ids.append(cur_node.id)
-                chain_source.append("lime_seed")
+                chain_source.append(seed_source)
                 continue
             # S_2 .. S_k: merge the next LIME leaf onto the running union
             union_mask = cur_mask | leaf_mask[l]
@@ -352,64 +384,66 @@ class PyramidExplainer(Explainer):
             chain_v.append(cur_v)
             chain_delta.append(float(merged.delta))
             chain_node_ids.append(cur_node.id)
-            chain_source.append("lime_seed")
+            chain_source.append(seed_source)
 
         # ---- greedy phase: CELF lazy-greedy on v(S u {l}) ------------- #
-        heap: list = []
-        tiebreak = itertools.count()
-        for l in uniq:
-            if l in in_set:
-                continue
-            # seed bound: marginal gain of l over the current seed set
-            union_mask = cur_mask | leaf_mask[l]
-            v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
-            n_fresh_q += 1
-            heapq.heappush(heap, (-(v_union - cur_v), next(tiebreak), l))
-
-        while len(in_set) < len(uniq):
-            best_leaf = None
-            best_union_mask = None
-            best_union_v = None
-            while heap:
-                neg_bound, _, l = heapq.heappop(heap)
+        # Skipped entirely in full_lime mode (in_set already == all leaves).
+        if not self.full_lime:
+            heap: list = []
+            tiebreak = itertools.count()
+            for l in uniq:
                 if l in in_set:
                     continue
+                # seed bound: marginal gain of l over the current seed set
                 union_mask = cur_mask | leaf_mask[l]
                 v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
                 n_fresh_q += 1
-                gain = v_union - cur_v
-                nxt = -heap[0][0] if heap else -np.inf
-                if gain >= nxt:
-                    best_leaf = l
-                    best_union_mask, best_union_v = union_mask, v_union
+                heapq.heappush(heap, (-(v_union - cur_v), next(tiebreak), l))
+
+            while len(in_set) < len(uniq):
+                best_leaf = None
+                best_union_mask = None
+                best_union_v = None
+                while heap:
+                    neg_bound, _, l = heapq.heappop(heap)
+                    if l in in_set:
+                        continue
+                    union_mask = cur_mask | leaf_mask[l]
+                    v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
+                    n_fresh_q += 1
+                    gain = v_union - cur_v
+                    nxt = -heap[0][0] if heap else -np.inf
+                    if gain >= nxt:
+                        best_leaf = l
+                        best_union_mask, best_union_v = union_mask, v_union
+                        break
+                    else:
+                        heapq.heappush(heap, (-gain, next(tiebreak), l))
+
+                if best_leaf is None:
                     break
-                else:
-                    heapq.heappush(heap, (-gain, next(tiebreak), l))
 
-            if best_leaf is None:
-                break
+                l = best_leaf
+                leaf_child = leaf_node[l]
+                merged = _Node(
+                    id=next_id,
+                    mask=best_union_mask,
+                    children=[cur_node, leaf_child],
+                    v=best_union_v,
+                )
+                merged.delta = best_union_v - (cur_v + leaf_value[l])
+                node[next_id] = merged
+                merge_order.append((cur_node.id, leaf_child.id, next_id, float(merged.delta)))
 
-            l = best_leaf
-            leaf_child = leaf_node[l]
-            merged = _Node(
-                id=next_id,
-                mask=best_union_mask,
-                children=[cur_node, leaf_child],
-                v=best_union_v,
-            )
-            merged.delta = best_union_v - (cur_v + leaf_value[l])
-            node[next_id] = merged
-            merge_order.append((cur_node.id, leaf_child.id, next_id, float(merged.delta)))
+                cur_node, cur_mask, cur_v = merged, best_union_mask, best_union_v
+                in_set.add(l)
+                next_id += 1
 
-            cur_node, cur_mask, cur_v = merged, best_union_mask, best_union_v
-            in_set.add(l)
-            next_id += 1
-
-            chain.append(l)
-            chain_v.append(cur_v)
-            chain_delta.append(float(merged.delta))
-            chain_node_ids.append(cur_node.id)
-            chain_source.append("greedy")
+                chain.append(l)
+                chain_v.append(cur_v)
+                chain_delta.append(float(merged.delta))
+                chain_node_ids.append(cur_node.id)
+                chain_source.append("greedy")
 
         root = cur_node
 
@@ -434,6 +468,7 @@ class PyramidExplainer(Explainer):
             "n_construction_queries": int(n_fresh_q),
             "n_lime_queries": int(n_lime_q),
             "k_lime_used": int(k_seed),
+            "full_lime": bool(self.full_lime),
             "lime_ranked": [int(l) for l in lime_ranked],
             "lime_seed_leaves": [int(l) for l in seed_leaves],
             "lime_coeff": {int(l): float(c) for l, c in lime_coeff.items()},
@@ -535,7 +570,7 @@ class PyramidExplainer(Explainer):
         # LIME-order control: pure surrogate rank, no greedy v(S) decisions.
         # This is the key control for the LIME-primed method: if the greedy
         # curve does not rise faster than this, the model's joint-score steps
-        # add nothing beyond LIME.
+        # add nothing beyond LIME. In full_lime mode the chain equals this curve.
         lime_curve = curve_for_order(list(lime_ranked))
 
         return {
@@ -655,10 +690,12 @@ class PyramidExplainer(Explainer):
                 "grid": self.grid,
                 "n_leaves": len(leaves),
                 "n_internal": len(internals),
-                "merge_rule": "lime_seeded_nested_greedy_joint_score",
+                "merge_rule": ("lime_full_order" if self.full_lime
+                               else "lime_seeded_nested_greedy_joint_score"),
                 # LIME prior
                 "k_lime": self.k_lime,
                 "k_lime_used": tinfo["k_lime_used"],
+                "full_lime": tinfo["full_lime"],
                 "lime_ranked": tinfo["lime_ranked"],
                 "lime_seed_leaves": tinfo["lime_seed_leaves"],
                 "lime_coeff": tinfo["lime_coeff"],

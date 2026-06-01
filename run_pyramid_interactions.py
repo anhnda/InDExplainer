@@ -43,6 +43,8 @@ def main():
     ap.add_argument("--target", type=int, default=None,
                     help="class index; default = model top-1")
     ap.add_argument("--static-png", default="pyramid_interactions.png")
+    ap.add_argument("--full_lime", action="store_true", default=False)
+
     ap.add_argument("--mask-budget", type=int, default=400,
                     help="max internal nodes carrying an explicit RLE mask "
                          "(others reconstruct from descendant leaves in-browser)")
@@ -56,6 +58,8 @@ def main():
     expl = PyramidExplainer(
         model, target_class=args.target, device=device, class_names=class_names,
         sigma=args.sigma, n_segments=args.n_segments, compactness=args.compactness,
+        full_lime=args.full_lime,
+
     )
     res = expl.explain(x)
 
