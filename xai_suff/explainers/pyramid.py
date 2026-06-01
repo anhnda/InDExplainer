@@ -120,7 +120,7 @@ class PyramidExplainer(Explainer):
         grid: tuple = (12, 12),           # grid leaves when segmentation="grid"
         value_mode: str = "prob",        # "logit" (paper Def 3) or "prob"
         # --- LIME prior ------------------------------------------------- #
-        k_lime: int = 2,                  # number of top-LIME leaves used to seed S
+        k_lime: int = 10,                  # number of top-LIME leaves used to seed S
         lime_n_samples: int = 1000,       # LIME perturbation samples
         lime_kernel_width: float = 0.25,  # LIME locality kernel width
         lime_alpha: float = 1.0,          # LIME ridge regularization
