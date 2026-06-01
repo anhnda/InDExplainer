@@ -95,7 +95,7 @@ class PyramidExplainer(Explainer):
         sigma: float = 11.0,              # blur strength for Phi complement
         n_segments: int = 144,            # target number of leaf superpixels (SLIC)
         compactness: float = 2,           # SLIC compactness
-        value_mode: str = "logit",        # "logit" (paper Def 3) or "prob"
+        value_mode: str = "prob",        # "logit" (paper Def 3) or "prob"
         swap_audit: bool = True,          # run 1-swap local-optimality certificate
         swap_levels: Optional[list] = None,  # which k to audit; None -> a few checkpoints
         run_controls: bool = True,        # random + color tree concentration controls
