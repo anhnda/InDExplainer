@@ -1,52 +1,73 @@
-"""PyramidExplainer -- nested greedy joint-score chain with merge residuals.
+"""PyramidExplainer -- LIME-primed, sequential nested greedy joint-score chain.
+
+What changed vs. the pure-greedy version
+-----------------------------------------
+The nested coalition is now *seeded* by a LIME prior and then grown by greedy
+joint-score steps:
+
+    1. LIME pass on the leaves (SLIC superpixels or grid cells) gives one
+       surrogate coefficient per leaf -> a ranked leaf list.
+    2. The top-`k_lime` LIME leaves (default k=2) are inserted FIRST, in LIME
+       rank order. These form S_1 c S_2 c ... c S_k as the chain seed.
+    3. From S_k onward the chain grows by the original nested greedy-add-leaf
+       rule on the joint reveal score:
+            S_{j} = S_{j-1} u {argmax_{l not in S_{j-1}} v(S_{j-1} u {l})}.
+
+So LIME only fixes the FIRST k leaves; every later leaf is chosen by the real
+model joint score v(S u {l}) (the target-class response on the revealed set).
+This keeps the non-circularity of the original design (the accept criterion is a
+genuine model output, not the residual Delta) while letting a cheap surrogate
+warm-start the root of the chain.
+
+Honesty note (read before trusting the tree)
+---------------------------------------------
+With k=2 the structural commitment to LIME is small: only the two top LIME
+leaves are forced; the rest of the tree is the model's own greedy ordering. The
+LIME-order control curve (built in pure LIME rank) is reported alongside the
+greedy curve so the LIME contribution can be checked directly -- if the greedy
+v(S_k) curve does not rise faster than the LIME-order curve, the model's joint
+score decisions are not doing real work beyond the surrogate.
 
 Selection signal
 ----------------
-We build the region tree by *greedily growing a single nested coalition* on the
-**joint reveal score** v(S) = f(Phi_S(x)) - f(x0), NOT on the merge residual
-Delta. This is the key change from the Delta-greedy construction: Delta is a
-*gap* (v(AuB) - v(A) - v(B)); building on Delta is circular (a tree built to
-maximise Delta will show large Delta). v(S) is bounded above by v(root) and is
-a genuine model output, so optimising it is non-circular -- we optimise the
-quantity we report.
+Joint reveal score v(S) = f(Phi_S(x)) - f(x0), a genuine model output bounded
+above by v(root); NOT the merge residual Delta (building on Delta is circular).
 
-Construction (nested greedy-add-leaf)
--------------------------------------
-    S_1 = argmax_l v({l})
-    S_k = S_{k-1} u {argmax_{l not in S_{k-1}} v(S_{k-1} u {l})}
+Construction (LIME-seeded nested greedy-add-leaf)
+-------------------------------------------------
+    seed:  S_1..S_k  = top-k LIME-ranked leaves, in LIME order
+    grow:  S_{j}     = S_{j-1} u {argmax_{l notin S_{j-1}} v(S_{j-1} u {l})}
 
-Each step appends one leaf, creating one binary internal node (running union +
-the newly added leaf). The chain S_1 c S_2 c ... c S_n is the trace from a
-single leaf up to the root (= all leaves). Because the partition at every node
-is disjoint (parent = running-union-child + one fresh-leaf-child), Theorem 1
+Each step appends one leaf, creating one binary internal node (running-union +
+the newly added leaf). The chain S_1 c S_2 c ... c S_n is the trace from the
+seed up to the root (= all leaves). The partition at every node is disjoint
+(parent = running-union-child + one fresh-leaf-child), so Theorem 1
 (telescoping) holds unchanged:
 
     v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
 
-No adjacency constraint: the best next leaf may be spatially non-contiguous
-(the cooperative Figure-1 case). A lazy-greedy (CELF) upper-bound heap keeps the
-forward count near-linear when v is roughly submodular.
+A lazy-greedy (CELF) upper-bound heap keeps the greedy phase near-linear when v
+is roughly submodular.
 
 Optimality claim (honest)
 -------------------------
-Greedy yields the *nested-greedy-best* size-k set, exactly optimal iff v is
-monotone submodular and (1-1/e)-optimal otherwise -- NOT the global best size-k
-set. We strengthen and certify each level with a **1-swap local-search audit**:
-try replacing one in-set leaf with one out-of-set leaf; if no single swap raises
-v, S_k is a certified 1-swap local optimum. This is the checkable form of "no
-other same-size set scores higher" (local / high-probability, since v is not
-guaranteed monotone). Swaps may break strict nesting, so the *audit* is reported
-separately and the *telescoping tree* is always built from the pure nested chain.
+The seed leaves are LIME-chosen, NOT joint-score-optimal; only the greedy phase
+is nested-greedy-best (exactly optimal iff v is monotone submodular, (1-1/e)
+otherwise). Each level is still certified by a 1-swap local-search audit: try
+replacing one in-set leaf with one out-of-set leaf; if no single swap raises v,
+S_k is a certified 1-swap local optimum. Swaps may break strict nesting, so the
+audit is reported separately and the telescoping tree is always built from the
+pure nested chain.
 
 Controls (mandatory, not optional)
 ----------------------------------
-Random-tree / color-tree controls compare how fast v(S_k) rises with k against
-the greedy chain. If a blind tree concentrates the model score just as fast, the
-chain is not doing real work. Reference (blur sigma) and query counts are logged.
+Random-tree, color-tree, AND LIME-order controls compare how fast v(S_k) rises
+with k against the greedy chain. If a blind/LIME-only tree concentrates the model
+score just as fast, the greedy phase is not doing real work.
 
 Per-pixel attribution remains the leaf-additive density v(leaf)/area(leaf);
-Delta, the sufficiency node, the greedy concentration curve, and the swap audit
-are reported in `extras`.
+Delta, the sufficiency node, the greedy concentration curve, the LIME ranking,
+and the swap audit are reported in `extras`.
 """
 from __future__ import annotations
 
@@ -59,7 +80,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-try:  # scikit-image is used for the leaf segmentation
+try:  # scikit-image is used for the SLIC leaf segmentation
     from skimage.segmentation import slic
     _HAS_SKIMAGE = True
 except Exception:  # pragma: no cover - skimage layout varies across versions
@@ -93,12 +114,21 @@ class PyramidExplainer(Explainer):
         self,
         *args,
         sigma: float = 11.0,              # blur strength for Phi complement
-        n_segments: int = 144,            # target number of leaf superpixels (SLIC)
+        segmentation: str = "slic",       # "slic" (default) or "grid"
+        n_segments: int = 144,            # target leaf count (SLIC) or ~grid cells
         compactness: float = 2,           # SLIC compactness
+        grid: tuple = (12, 12),           # grid leaves when segmentation="grid"
         value_mode: str = "prob",        # "logit" (paper Def 3) or "prob"
+        # --- LIME prior ------------------------------------------------- #
+        k_lime: int = 2,                  # number of top-LIME leaves used to seed S
+        lime_n_samples: int = 1000,       # LIME perturbation samples
+        lime_kernel_width: float = 0.25,  # LIME locality kernel width
+        lime_alpha: float = 1.0,          # LIME ridge regularization
+        lime_batch_size: int = 64,        # LIME forward batch size
+        # --- audits / controls ----------------------------------------- #
         swap_audit: bool = True,          # run 1-swap local-optimality certificate
         swap_levels: Optional[list] = None,  # which k to audit; None -> a few checkpoints
-        run_controls: bool = True,        # random + color tree concentration controls
+        run_controls: bool = True,        # random + color + lime-order controls
         n_random_trees: int = 5,          # random-chain controls to average
         suff_eps: float = 0.05,           # sufficiency: v(S) >= (1-eps) v(root)
         seed: int = 0,
@@ -107,10 +137,19 @@ class PyramidExplainer(Explainer):
         super().__init__(*args, **kw)
         if value_mode not in ("logit", "prob"):
             raise ValueError(f"value_mode must be 'logit' or 'prob', got {value_mode!r}")
+        if segmentation not in ("slic", "grid"):
+            raise ValueError(f"segmentation must be 'slic' or 'grid', got {segmentation!r}")
         self.sigma = sigma
+        self.segmentation = segmentation
         self.n_segments = n_segments
         self.compactness = compactness
+        self.grid = grid
         self.value_mode = value_mode
+        self.k_lime = int(k_lime)
+        self.lime_n_samples = lime_n_samples
+        self.lime_kernel_width = lime_kernel_width
+        self.lime_alpha = lime_alpha
+        self.lime_batch_size = lime_batch_size
         self.swap_audit = swap_audit
         self.swap_levels = swap_levels
         self.run_controls = run_controls
@@ -140,10 +179,14 @@ class PyramidExplainer(Explainer):
         return self._score(self._phi(x, b, mask_bool), target) - x0_val
 
     # ------------------------------------------------------------------ #
-    # leaf segmentation
+    # leaf segmentation: SLIC (default) or fixed grid
     # ------------------------------------------------------------------ #
     def _leaf_labels(self, img01: np.ndarray) -> np.ndarray:
-        """Return an (H,W) int label map of leaf superpixels."""
+        """Return an (H,W) int label map of leaf regions."""
+        H, W = img01.shape[:2]
+        if self.segmentation == "grid":
+            return self._grid_labels(H, W)
+        # SLIC (default), with a grid fallback if skimage is unavailable.
         if _HAS_SKIMAGE:
             labels = slic(
                 img01,
@@ -153,33 +196,97 @@ class PyramidExplainer(Explainer):
                 channel_axis=2,
             )
             return labels.astype(np.int64)
-        # Fallback: regular grid tiling if skimage is unavailable.
-        H, W = img01.shape[:2]
-        side = max(1, int(round(np.sqrt(self.n_segments))))
-        ys = (np.arange(H) * side // H).astype(np.int64)
-        xs = (np.arange(W) * side // W).astype(np.int64)
-        labels = (ys[:, None] * side + xs[None, :]).astype(np.int64)
+        return self._grid_labels(H, W)
+
+    def _grid_labels(self, H: int, W: int) -> np.ndarray:
+        """Regular grid tiling -> (H,W) int label map.
+
+        Uses `self.grid = (gh, gw)` directly when segmentation='grid'; otherwise
+        falls back to a near-square grid with ~n_segments cells.
+        """
+        if self.segmentation == "grid":
+            gh, gw = self.grid
+        else:
+            gh = gw = max(1, int(round(np.sqrt(self.n_segments))))
+        ys = (np.arange(H) * gh // H).clip(max=gh - 1).astype(np.int64)
+        xs = (np.arange(W) * gw // W).clip(max=gw - 1).astype(np.int64)
+        labels = (ys[:, None] * gw + xs[None, :]).astype(np.int64)
         return labels
 
     # ------------------------------------------------------------------ #
-    # nested greedy-add-leaf chain on the joint score v(union)
+    # LIME prior over leaves: weighted-ridge surrogate -> per-leaf coeff
+    # ------------------------------------------------------------------ #
+    def _lime_rank(self, labels: np.ndarray, x, b, target: int):
+        """Fit a LIME-style weighted linear surrogate on the leaf on/off vectors
+        and return leaves ranked by descending surrogate coefficient.
+
+        Interpretable features = leaves (1 = keep sharp, 0 = blur). Same recipe
+        as the standalone LIME explainer, but on the Pyramid leaf label map
+        (SLIC or grid) rather than a separate fixed grid -- so the ranking is in
+        the exact leaf vocabulary the tree is built from.
+
+        Returns (ranked_leaf_labels, coeff_by_label, n_forward_queries).
+        """
+        uniq = [int(l) for l in np.unique(labels)]
+        n_cells = len(uniq)
+        label_to_col = {l: j for j, l in enumerate(uniq)}
+
+        # contiguous (H,W) column-index map for fast per-pixel gather
+        col_map = np.empty_like(labels)
+        for l in uniq:
+            col_map[labels == l] = label_to_col[l]
+        col_map_t = torch.as_tensor(col_map, dtype=torch.long, device=x.device)
+
+        g = torch.Generator(device="cpu").manual_seed(self.seed)
+        Z = (torch.rand(self.lime_n_samples, n_cells, generator=g) > 0.5).float()
+        Z[0] = 1.0  # include the all-on sample (full image)
+
+        probs = np.zeros(self.lime_n_samples, dtype=np.float64)
+        n_q = 0
+        for start in range(0, self.lime_n_samples, self.lime_batch_size):
+            zb = Z[start:start + self.lime_batch_size].to(x.device)   # (B,n_cells)
+            keep = zb[:, col_map_t]                                   # (B,H,W)
+            keep = keep.unsqueeze(1)                                  # (B,1,H,W)
+            comp = keep * x + (1.0 - keep) * b
+            with torch.no_grad():
+                out = self.model(comp)
+                if self.value_mode == "logit":
+                    p = out[:, target]
+                else:
+                    p = F.softmax(out, dim=1)[:, target]
+            probs[start:start + zb.shape[0]] = p.detach().cpu().numpy()
+            n_q += zb.shape[0]
+
+        # cosine-distance locality weights to the all-on vector
+        Znp = Z.cpu().numpy()
+        all_on = np.ones(n_cells)
+        d = 1.0 - (Znp @ all_on) / (
+            np.linalg.norm(Znp, axis=1) * np.linalg.norm(all_on) + 1e-12
+        )
+        weights = np.exp(-(d ** 2) / (self.lime_kernel_width ** 2))
+
+        coefs = _weighted_ridge(Znp, probs, weights, alpha=self.lime_alpha)  # (n_cells,)
+
+        coeff_by_label = {l: float(coefs[label_to_col[l]]) for l in uniq}
+        ranked = sorted(uniq, key=lambda l: coeff_by_label[l], reverse=True)
+        return ranked, coeff_by_label, n_q
+
+    # ------------------------------------------------------------------ #
+    # LIME-seeded nested greedy-add-leaf chain on the joint score v(union)
     # ------------------------------------------------------------------ #
     def _build_tree(self, img01, labels, x, b, x0_val: float, target: int):
-        """Grow one nested coalition S_1 c S_2 c ... by greedily adding the leaf
-        that most increases the joint score v(S u {l}). Returns (root, info).
-
-        Lazy-greedy (CELF): each candidate leaf keeps an upper bound on its
-        marginal gain (its gain at the last time it was evaluated). The leaf with
-        the highest stale bound is re-evaluated against the current set; if its
-        fresh gain still tops the heap, it is accepted -- otherwise it is pushed
-        back with the refreshed (smaller) bound. Under submodularity this gives
-        the exact greedy pick with far fewer forwards than n per step.
+        """Grow one nested coalition: seed with the top-`k_lime` LIME leaves (in
+        LIME order), then greedily add the leaf that most increases v(S u {l}).
+        Returns (root, info).
         """
         uniq = [int(l) for l in np.unique(labels)]
         leaf_mask = {l: (labels == l) for l in uniq}
         leaf_color = {l: img01[leaf_mask[l]].mean(axis=0) for l in uniq}
 
         n_fresh_q = 0
+
+        # ---- LIME prior ranking --------------------------------------- #
+        lime_ranked, lime_coeff, n_lime_q = self._lime_rank(labels, x, b, target)
 
         # ---- leaf nodes + individual values --------------------------- #
         node: dict[int, _Node] = {}
@@ -195,39 +302,72 @@ class PyramidExplainer(Explainer):
             leaf_value[l] = v_l
             next_id += 1
 
-        # ---- greedy state --------------------------------------------- #
-        # S_1: leaf with the largest individual value.
-        first = max(uniq, key=lambda l: leaf_value[l])
-        cur_mask = leaf_mask[first].copy()
-        cur_v = leaf_value[first]
-        cur_node = leaf_node[first]            # running-union node (starts as a leaf)
-        in_set = {first}
-
-        chain = [first]                         # leaf-label order of inclusion
-        chain_v = [cur_v]                       # v(S_k) after each inclusion
-        chain_delta = [0.0]                     # Delta at each merge (0 for S_1)
-        chain_node_ids = [cur_node.id]          # running-union node id per level
+        # ---- chain bookkeeping ---------------------------------------- #
+        chain = []                              # leaf-label order of inclusion
+        chain_v = []                            # v(S_k) after each inclusion
+        chain_delta = []                        # Delta at each merge (0 for S_1)
+        chain_node_ids = []                     # running-union node id per level
+        chain_source = []                       # "lime_seed" or "greedy" per level
         merge_order = []                        # (running_id, leaf_id, merged_id, delta)
+        in_set: set = set()
 
-        # lazy-greedy heap of candidate leaves: (-upper_bound_gain, tiebreak, leaf)
+        # ---- seed phase: top-k LIME leaves, in LIME rank order -------- #
+        k_seed = max(1, min(self.k_lime, len(uniq)))
+        seed_leaves = lime_ranked[:k_seed]
+
+        cur_node = None
+        cur_mask = None
+        cur_v = None
+        for l in seed_leaves:
+            if cur_node is None:
+                # S_1
+                cur_mask = leaf_mask[l].copy()
+                cur_v = leaf_value[l]
+                cur_node = leaf_node[l]
+                in_set.add(l)
+                chain.append(l)
+                chain_v.append(cur_v)
+                chain_delta.append(0.0)
+                chain_node_ids.append(cur_node.id)
+                chain_source.append("lime_seed")
+                continue
+            # S_2 .. S_k: merge the next LIME leaf onto the running union
+            union_mask = cur_mask | leaf_mask[l]
+            v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
+            n_fresh_q += 1
+            leaf_child = leaf_node[l]
+            merged = _Node(
+                id=next_id,
+                mask=union_mask,
+                children=[cur_node, leaf_child],
+                v=v_union,
+            )
+            merged.delta = v_union - (cur_v + leaf_value[l])
+            node[next_id] = merged
+            merge_order.append((cur_node.id, leaf_child.id, next_id, float(merged.delta)))
+            cur_node, cur_mask, cur_v = merged, union_mask, v_union
+            in_set.add(l)
+            next_id += 1
+            chain.append(l)
+            chain_v.append(cur_v)
+            chain_delta.append(float(merged.delta))
+            chain_node_ids.append(cur_node.id)
+            chain_source.append("lime_seed")
+
+        # ---- greedy phase: CELF lazy-greedy on v(S u {l}) ------------- #
         heap: list = []
         tiebreak = itertools.count()
-        # initial upper bound on each candidate's marginal gain: gain of adding it
-        # to S_1 is unknown, so seed with its own leaf value (a cheap proxy; CELF
-        # only requires the bound to start >= true gain in the submodular case,
-        # which v({l}) is when v is submodular and monotone -- otherwise CELF still
-        # returns a valid greedy pick because we always re-evaluate before accept).
         for l in uniq:
-            if l == first:
+            if l in in_set:
                 continue
-            heapq.heappush(heap, (-leaf_value[l], next(tiebreak), l))
+            # seed bound: marginal gain of l over the current seed set
+            union_mask = cur_mask | leaf_mask[l]
+            v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
+            n_fresh_q += 1
+            heapq.heappush(heap, (-(v_union - cur_v), next(tiebreak), l))
 
-        # ---- grow the chain ------------------------------------------- #
         while len(in_set) < len(uniq):
-            # CELF: pop the stalest-best candidate, refresh its gain, accept if it
-            # still tops the heap; otherwise reinsert with the refreshed bound.
             best_leaf = None
-            best_gain = None
             best_union_mask = None
             best_union_v = None
             while heap:
@@ -238,20 +378,18 @@ class PyramidExplainer(Explainer):
                 v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
                 n_fresh_q += 1
                 gain = v_union - cur_v
-                # peek the next stale bound; accept if our fresh gain beats it
                 nxt = -heap[0][0] if heap else -np.inf
                 if gain >= nxt:
-                    best_leaf, best_gain = l, gain
+                    best_leaf = l
                     best_union_mask, best_union_v = union_mask, v_union
                     break
                 else:
                     heapq.heappush(heap, (-gain, next(tiebreak), l))
 
-            if best_leaf is None:  # heap drained of valid candidates
+            if best_leaf is None:
                 break
 
             l = best_leaf
-            # new internal node: children = running-union node + the new leaf node
             leaf_child = leaf_node[l]
             merged = _Node(
                 id=next_id,
@@ -259,15 +397,11 @@ class PyramidExplainer(Explainer):
                 children=[cur_node, leaf_child],
                 v=best_union_v,
             )
-            # Delta at this merge: v(S_k) - [v(S_{k-1}) + v({l})]
             merged.delta = best_union_v - (cur_v + leaf_value[l])
             node[next_id] = merged
             merge_order.append((cur_node.id, leaf_child.id, next_id, float(merged.delta)))
 
-            # advance state
-            cur_node = merged
-            cur_mask = best_union_mask
-            cur_v = best_union_v
+            cur_node, cur_mask, cur_v = merged, best_union_mask, best_union_v
             in_set.add(l)
             next_id += 1
 
@@ -275,6 +409,7 @@ class PyramidExplainer(Explainer):
             chain_v.append(cur_v)
             chain_delta.append(float(merged.delta))
             chain_node_ids.append(cur_node.id)
+            chain_source.append("greedy")
 
         root = cur_node
 
@@ -287,15 +422,21 @@ class PyramidExplainer(Explainer):
                 suff_node, suff_area = nd, nd.area
 
         info = {
-            "chain": chain,                       # leaf labels in inclusion order
-            "chain_v": chain_v,                   # v(S_k) per level (concentration curve)
-            "chain_delta": chain_delta,           # Delta realised at each merge
+            "chain": chain,
+            "chain_v": chain_v,
+            "chain_delta": chain_delta,
             "chain_node_ids": chain_node_ids,
+            "chain_source": chain_source,         # provenance of each level
             "merge_order": merge_order,
             "v_root_est": float(v_root_est),
             "suff_node_id": int(suff_node.id),
             "suff_v": float(suff_node.v),
             "n_construction_queries": int(n_fresh_q),
+            "n_lime_queries": int(n_lime_q),
+            "k_lime_used": int(k_seed),
+            "lime_ranked": [int(l) for l in lime_ranked],
+            "lime_seed_leaves": [int(l) for l in seed_leaves],
+            "lime_coeff": {int(l): float(c) for l, c in lime_coeff.items()},
             "leaf_value": leaf_value,
             "leaf_mask": leaf_mask,
             "leaf_color": leaf_color,
@@ -316,7 +457,7 @@ class PyramidExplainer(Explainer):
 
         if self.swap_levels is not None:
             levels = [k for k in self.swap_levels if 1 <= k <= len(chain)]
-        else:  # default checkpoints: 1, n/8, n/4, n/2 leaves (where structure is read)
+        else:  # default checkpoints: 1, n/8, n/4, n/2 leaves
             cand = sorted({1, max(1, n // 8), max(1, n // 4), max(1, n // 2)})
             levels = [k for k in cand if k <= len(chain)]
 
@@ -325,7 +466,6 @@ class PyramidExplainer(Explainer):
         for k in levels:
             S = set(chain[:k])
             outside = [l for l in uniq if l not in S]
-            # base mask / value for S_k
             base_mask = np.zeros_like(next(iter(leaf_mask.values())))
             for l in S:
                 base_mask = base_mask | leaf_mask[l]
@@ -350,20 +490,22 @@ class PyramidExplainer(Explainer):
             audits[int(k)] = {
                 "v_S": float(v_S),
                 "is_1swap_local_opt": bool(best_swap is None),
-                "best_improving_swap": best_swap,      # None => certified local opt
+                "best_improving_swap": best_swap,
                 "best_improve": float(best_improve),
             }
         return audits, n_q
 
     # ------------------------------------------------------------------ #
-    # control chains: how fast does v(S_k) rise for a blind ordering?
+    # control chains: how fast does v(S_k) rise for a blind / LIME ordering?
     # ------------------------------------------------------------------ #
     def _control_curves(self, tinfo, x, b, x0_val, target):
-        """Random-leaf-order and color-order nested chains, for comparison with
-        the greedy concentration curve. Returns mean curves and forward count."""
+        """Random-leaf-order, color-order, and LIME-order nested chains, for
+        comparison with the greedy concentration curve. Returns mean curves and
+        forward count."""
         uniq = tinfo["uniq"]
         leaf_mask = tinfo["leaf_mask"]
         leaf_color = tinfo["leaf_color"]
+        lime_ranked = tinfo["lime_ranked"]
         rng = np.random.default_rng(self.seed)
         n_q = 0
 
@@ -385,19 +527,26 @@ class PyramidExplainer(Explainer):
             rand_curves.append(curve_for_order(order))
         rand_mean = np.mean(np.array(rand_curves), axis=0).tolist()
 
-        # color control: order by descending brightness (a model-blind heuristic)
+        # color control: descending brightness (model-blind heuristic)
         bright = {l: float(np.mean(leaf_color[l])) for l in uniq}
         color_order = sorted(uniq, key=lambda l: bright[l], reverse=True)
         color_curve = curve_for_order(color_order)
 
+        # LIME-order control: pure surrogate rank, no greedy v(S) decisions.
+        # This is the key control for the LIME-primed method: if the greedy
+        # curve does not rise faster than this, the model's joint-score steps
+        # add nothing beyond LIME.
+        lime_curve = curve_for_order(list(lime_ranked))
+
         return {
             "random_mean_curve": rand_mean,
             "color_curve": color_curve,
+            "lime_curve": lime_curve,
             "n_random_trees": self.n_random_trees,
         }, n_q
 
     # ------------------------------------------------------------------ #
-    # telescoping value/residual fill (reuses construction values)
+    # tree traversal
     # ------------------------------------------------------------------ #
     def _collect(self, root: _Node):
         leaves, internals, alln = [], [], []
@@ -432,7 +581,7 @@ class PyramidExplainer(Explainer):
         leaves, internals, _ = self._collect(root)
         leaf_masks = {leaf.id: leaf.mask for leaf in leaves}
 
-        # --- telescoping identity (Delta already set at construction) ------- #
+        # --- telescoping identity (Delta set at construction) --------------- #
         sum_leaf_v = float(sum(l.v for l in leaves))
         sum_delta = float(sum(r.delta for r in internals))
         identity_lhs = float(root.v)
@@ -489,6 +638,7 @@ class PyramidExplainer(Explainer):
         walk(root)
 
         n_construction_q = tinfo["n_construction_queries"]
+        n_lime_q = tinfo["n_lime_queries"]
         return AttributionResult(
             attribution=attr,
             method=self.name,
@@ -500,15 +650,25 @@ class PyramidExplainer(Explainer):
             extras={
                 "value_mode": self.value_mode,
                 "sigma": self.sigma,
+                "segmentation": self.segmentation,
                 "n_segments": self.n_segments,
+                "grid": self.grid,
                 "n_leaves": len(leaves),
                 "n_internal": len(internals),
-                "merge_rule": "nested_greedy_joint_score",
+                "merge_rule": "lime_seeded_nested_greedy_joint_score",
+                # LIME prior
+                "k_lime": self.k_lime,
+                "k_lime_used": tinfo["k_lime_used"],
+                "lime_ranked": tinfo["lime_ranked"],
+                "lime_seed_leaves": tinfo["lime_seed_leaves"],
+                "lime_coeff": tinfo["lime_coeff"],
+                "chain_source": tinfo["chain_source"],
                 # query accounting
+                "n_lime_queries": n_lime_q,
                 "n_construction_queries": n_construction_q,
                 "n_audit_queries": n_audit_q,
                 "n_control_queries": n_control_q,
-                "n_total_queries": n_construction_q + n_audit_q + n_control_q,
+                "n_total_queries": n_lime_q + n_construction_q + n_audit_q + n_control_q,
                 # telescoping self-check
                 "root_v": float(root.v),
                 "sum_leaf_v": sum_leaf_v,
@@ -519,7 +679,7 @@ class PyramidExplainer(Explainer):
                 "nai": nai,
                 # the nested greedy trace (the main object)
                 "chain": tinfo["chain"],
-                "chain_v": tinfo["chain_v"],            # greedy concentration curve
+                "chain_v": tinfo["chain_v"],
                 "chain_delta": tinfo["chain_delta"],
                 "chain_node_ids": tinfo["chain_node_ids"],
                 "merge_order": tinfo["merge_order"],
@@ -531,11 +691,25 @@ class PyramidExplainer(Explainer):
                 "resid_above_frac": resid_above_frac,
                 "suff_eps": self.suff_eps,
                 # optimality audit + controls
-                "swap_audits": swap_audits,             # per-level 1-swap certificates
-                "controls": controls,                   # random/color concentration curves
+                "swap_audits": swap_audits,
+                "controls": controls,
                 # full tree + leaf masks
                 "tree": all_serialized,
                 "leaf_masks": leaf_masks,
                 "reference": "blur_completion",
             },
         )
+
+
+def _weighted_ridge(Z, y, w, alpha=1.0):
+    """Closed-form weighted ridge; returns per-feature coefficients (intercept dropped)."""
+    n, d = Z.shape
+    Zb = np.concatenate([Z, np.ones((n, 1))], axis=1)  # add intercept
+    Wd = w[:, None]
+    A = Zb.T @ (Wd * Zb)
+    reg = alpha * np.eye(d + 1)
+    reg[-1, -1] = 0.0  # don't regularize intercept
+    A += reg
+    rhs = Zb.T @ (w * y)
+    sol = np.linalg.solve(A, rhs)
+    return sol[:-1]  # drop intercept
