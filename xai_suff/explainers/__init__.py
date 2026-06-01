@@ -1,4 +1,4 @@
-from .base import AttributionResult, Explainer, blur_reference
+from .base import AttributionResult, Explainer, blur_reference,make_reference
 from .ig import IGExplainer
 from .lime import LIMEExplainer
 from .sufficiency import SufficiencyExplainer
@@ -8,6 +8,7 @@ __all__ = [
     "AttributionResult",
     "Explainer",
     "blur_reference",
+    "make_reference",
     "IGExplainer",
     "LIMEExplainer",
     "SufficiencyExplainer",
