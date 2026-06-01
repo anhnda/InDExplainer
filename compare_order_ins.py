@@ -192,13 +192,13 @@ def main():
     ap.add_argument("--sigma", type=float, default=11.0)
     ap.add_argument("--n-segments", type=int, default=144)
     ap.add_argument("--compactness", type=float, default=2.0)
-    ap.add_argument("--k-lime", type=int, default=2,
-                    help="LIME seed leaves used by the pyramid chain")
     ap.add_argument("--del-fill", choices=["blur", "mean"], default="mean",
                     help="removal operator: mean = non-circular (default), "
                          "blur = shares Phi (circular)")
     ap.add_argument("--device",
                     default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--k-lime", type=int, default=10,
+                    help="LIME seed leaves used by the pyramid chain")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -230,8 +230,7 @@ def main():
     # rebuild the exact SLIC labels the explainer used (same seed/params -> same
     # map). We reuse the explainer's own leaf segmentation to avoid any drift.
     img01 = denormalize(x)[0].permute(1, 2, 0).cpu().numpy()
-    labels = expl._leaf_labels(img01)
-
+    labels = res.extras["leaf_labels"]   # exact map the chain indexes; do NOT re-segment
     # sanity: the two orders must be permutations of the same leaf set
     assert set(nested_order) == set(lime_order) == set(int(l) for l in np.unique(labels)), \
         "nested / lime / label leaf sets disagree -- grid is not shared"

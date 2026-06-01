@@ -615,6 +615,7 @@ class PyramidExplainer(Explainer):
 
         leaves, internals, _ = self._collect(root)
         leaf_masks = {leaf.id: leaf.mask for leaf in leaves}
+        leaf_masks_by_label = {int(l): m for l, m in tinfo["leaf_mask"].items()}
 
         # --- telescoping identity (Delta set at construction) --------------- #
         sum_leaf_v = float(sum(l.v for l in leaves))
@@ -733,6 +734,8 @@ class PyramidExplainer(Explainer):
                 # full tree + leaf masks
                 "tree": all_serialized,
                 "leaf_masks": leaf_masks,
+                "leaf_masks_by_label": leaf_masks_by_label,   # NEW: keyed by SLIC label
+                "leaf_labels": labels,  
                 "reference": "blur_completion",
             },
         )
