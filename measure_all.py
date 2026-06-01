@@ -31,6 +31,7 @@ biased differently by the two orderings.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 
@@ -64,6 +65,22 @@ METHODS = {
 }
 
 INFILLS = ["blur", "black", "white", "noise", "corners"]
+
+
+def _build_explainer(cls, model, **kwargs):
+    """Instantiate `cls`, dropping any kwargs its __init__ doesn't accept.
+
+    Explainer subclasses differ in signature (e.g. only sufficiency takes
+    `stochastic`, and not every method takes `infill`). We pass the superset
+    and filter per-class so a missing kwarg never raises TypeError.
+    """
+    params = inspect.signature(cls.__init__).parameters
+    accepts_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                         for p in params.values())
+    if accepts_var_kw:
+        return cls(model, **kwargs)
+    allowed = {k: v for k, v in kwargs.items() if k in params}
+    return cls(model, **allowed)
 
 
 # --------------------------------------------------------------------------- #
@@ -184,6 +201,12 @@ def main():
                     help="per-pixel insertion/deletion curve resolution")
     ap.add_argument("--del-fill", choices=["blur", "mean"], default="blur",
                     help="deletion removal operator (blur=shares infill, mean=independent)")
+    ap.add_argument("--measure-infill", default=None, choices=INFILLS,
+                    help="FIX the measurement reference b for ALL rows (decouples "
+                         "the metric's infill from each method's inner infill). "
+                         "Without this, each row is scored against its own infill, "
+                         "so the ruler changes per row and rows aren't comparable. "
+                         "Set this (e.g. 'blur') to rank inner infills fairly.")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -199,23 +222,37 @@ def main():
 
     infills = INFILLS if args.all_infills else [args.infill]
 
+    # Measurement reference. When --measure-infill is set, build it ONCE here so
+    # every row is scored against the SAME b (and same del_fill). This is what
+    # makes the inner-infill comparison fair: only the attribution map varies
+    # across rows, not the ruler. Without it, b is rebuilt per row from that
+    # row's own infill (back-compat; rows are NOT comparable to each other).
+    fixed_b = None
+    if args.measure_infill is not None:
+        fixed_b = make_reference(
+            x, mode=args.measure_infill, sigma=args.sigma).to(device)
+
     summary_lines = [f"image: {args.image}",
                      f"target: {target} ({class_names[target]})",
                      f"sigma: {args.sigma}",
                      f"infills: {infills}",
-                     f"measure: {args.measure} (del_fill={args.del_fill})", ""]
+                     f"measure: {args.measure} (del_fill={args.del_fill}, "
+                     f"measure_infill={args.measure_infill or 'per-row'})", ""]
 
     measure_rows = []   # flat records for JSON
     measure_curves = []  # curve dicts for plotting
 
     for infill in infills:
         b = make_reference(x, mode=infill, sigma=args.sigma).to(device)
+        # b_measure: the reference the METRIC uses. Fixed across rows if the
+        # user set --measure-infill, else each row's own b (back-compat).
+        b_measure = fixed_b if fixed_b is not None else b
         for name in args.methods:
             kwargs = dict(target_class=target, device=device,
                           class_names=class_names, sigma=args.sigma, infill=infill)
             if name == "sufficiency":
                 kwargs["stochastic"] = args.stochastic
-            explainer = METHODS[name](model, **kwargs)
+            explainer = _build_explainer(METHODS[name], model, **kwargs)
             print(f"[explain] running {name} (infill={infill}) ...")
             result = explainer.explain(x)
 
@@ -233,7 +270,7 @@ def main():
                          f" mass={result.extras.get('final_mass', float('nan')):.4f}")
 
             if args.measure:
-                reg, pix = _measure(model, x, result.attribution, target, b,
+                reg, pix = _measure(model, x, result.attribution, target, b_measure,
                                     args.cell_frac, args.steps, args.del_fill)
                 line += (f"\n    regional: ins-AUC={reg['insertion_auc']:.4f} "
                          f"del-AUC={reg['deletion_auc']:.4f}"
@@ -248,6 +285,7 @@ def main():
                     "pixel_insertion_auc": pix["insertion_auc"],
                     "pixel_deletion_auc": pix["deletion_auc"],
                     "del_fill": args.del_fill,
+                    "measure_infill": args.measure_infill or infill,
                 })
                 measure_curves.append({
                     "method": name, "infill": infill,
@@ -267,9 +305,17 @@ def main():
             json.dump(measure_rows, fh, indent=2)
 
         # compact AUC table sorted by regional insertion-AUC (higher = better)
+        if args.measure_infill is not None:
+            banner = (f"# measurement ruler FIXED: b={args.measure_infill}, "
+                      f"del_fill={args.del_fill} -> rows ARE comparable "
+                      f"(only the map varies)")
+        else:
+            banner = ("# measurement ruler PER-ROW (b = each row's own infill) "
+                      "-> rows are NOT directly comparable; "
+                      "pass --measure-infill to fix it")
         hdr = (f"{'method':<12}{'infill':<9}"
                f"{'reg_ins':>9}{'reg_del':>9}{'pix_ins':>9}{'pix_del':>9}")
-        table = [hdr, "-" * len(hdr)]
+        table = [banner, hdr, "-" * len(hdr)]
         for r in sorted(measure_rows,
                         key=lambda d: d["regional_insertion_auc"], reverse=True):
             table.append(
