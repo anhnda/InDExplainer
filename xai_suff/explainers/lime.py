@@ -44,7 +44,8 @@ class LIMEExplainer(Explainer):
         x = x.to(self.device)
         target = self._resolve_target(x)
         _, _, H, W = x.shape
-        b = blur_reference(x, self.sigma)
+        b = make_reference(x, mode=self.infill, sigma=self.sigma,
+                           noise_std=self.noise_std, seed=self.seed)
 
         cell_ids = self._cell_id_map(H, W).to(self.device)  # (H,W)
         n_cells = self.grid[0] * self.grid[1]
