@@ -1,14 +1,35 @@
 """Select the best global infill for a fixed classifier — GPU-resident, batched.
 
-Everything (features, energy, Mahalanobis, masks, composites) stays on the GPU.
-No per-image Python loops in the hot path; references are built batched.
+Measures TWO independent axes (do not collapse them into one scalar):
+
+  1. OOD  : k-NN distance in penultimate-feature space to a small calibration
+            set of real images. Lower = the composite's features look like real
+            images = on the model's familiar regime (on-R_f).
+            -> k-NN, NOT a Gaussian: no covariance to estimate, no N<<D
+               singularity, captures manifold shape with only ~50 points.
+            -> NOT energy: a class-neutral infill (the goal) has flat logits,
+               which an energy detector misreads as OOD. Energy conflates
+               off-manifold with class-ambiguous, so it is the wrong signal here.
+
+  2. NEUTRALITY : softmax entropy of the raw reference (high = flat logits =
+                  carries no class signal). This is a SEPARATE axis you want
+                  HIGH, the opposite of what energy would reward.
+
+Selection objective (higher = better):
+    score = - w_ood     * ood_dist        # feature k-NN distance, lower better
+            + w_neutral  * entropy          # flat logits, higher better
+            + w_removal  * removal          # f_x - f_b, higher better
+with an optional hard f_b ceiling (--neutral_cap).
+
+Everything (features, k-NN distances, masks, composites) stays on the GPU.
+References are built batched; masks are stacked into one forward per batch.
+Classifier-only: no autoencoder / flow / diffusion anywhere.
 
 Usage:
     python select_infill.py --calib ./benchmark_50 \
         --candidates blur black white noise corners --sigma 50
 
-Classifier-only: no autoencoder / flow / diffusion anywhere.
-Adjust get_feature_layer() and make_reference_batched() for your backbone.
+Adjust get_feature_layer() for your backbone (ResNet-50: avgpool; ViT: pre-head).
 """
 from __future__ import annotations
 
@@ -50,11 +71,10 @@ class _FeatHook:
 
 
 @torch.no_grad()
-def fwd_feats_energy(model, xb, hook):
-    """Batched forward -> (feats (B,D), energy (B,)) — both GPU tensors."""
+def fwd_feats_logits(model, xb, hook):
+    """Batched forward -> (feats (B,D), logits (B,C)) — both GPU tensors."""
     logits = model(xb)
-    energy = -torch.logsumexp(logits, dim=1)             # (B,)
-    return hook.feat.flatten(1), energy                  # stay on device
+    return hook.feat.flatten(1), logits
 
 
 # --------------------------------------------------------------------------- #
@@ -65,7 +85,7 @@ def make_reference_batched(xb_norm, mode="blur", sigma=50.0, gen=None):
     """Build references for a whole batch at once. xb_norm: (B,3,H,W) normalized."""
     x01 = denormalize(xb_norm)                           # (B,3,H,W) in [0,1]
     if mode == "blur":
-        b01 = gaussian_blur(x01, sigma).clamp(0, 1)      # separable, batched
+        b01 = gaussian_blur(x01, sigma).clamp(0, 1)
     elif mode == "black":
         b01 = torch.zeros_like(x01)
     elif mode == "white":
@@ -86,73 +106,55 @@ def make_reference_batched(xb_norm, mode="blur", sigma=50.0, gen=None):
 
 
 # --------------------------------------------------------------------------- #
-# Calibration band (GPU tensors throughout)
+# Calibration band: k-NN feature distance (GPU)
 # --------------------------------------------------------------------------- #
 @dataclass
-class ManifoldBand:
-    mu: torch.Tensor            # (D,)
-    prec: torch.Tensor          # (D,D) Sigma^{-1}, or (D,) if diagonal
-    tau_M: torch.Tensor         # scalar
-    tau_E: torch.Tensor         # scalar
-    diag: bool = False
+class KNNBand:
+    feats: torch.Tensor         # (N,D) calibration features (L2-normalized)
+    k: int
+    d_med: float                # median LOO k-NN distance on calib (for z-norm)
+    d_mad: float
+    tau: float                  # q-quantile LOO distance (pass/fail threshold)
 
-    def maha(self, F_):         # F_: (B,D) -> (B,)
-        d = F_ - self.mu
-        if self.diag:
-            return (d * self.prec * d).sum(1)
-        return torch.einsum("bd,de,be->b", d, self.prec, d)
+    def _knn_dist(self, q, exclude_self=False):
+        """Mean distance from each query (B,D) to its k nearest calib features."""
+        q = F.normalize(q, dim=1)
+        d = torch.cdist(q, self.feats)                   # (B,N) euclidean
+        kk = self.k + (1 if exclude_self else 0)
+        kk = min(kk, d.shape[1])
+        vals, _ = d.topk(kk, dim=1, largest=False)       # (B,kk)
+        if exclude_self:
+            vals = vals[:, 1:]                            # drop self (dist 0)
+        return vals.mean(dim=1)                           # (B,)
 
-    def passes(self, F_, E_):   # -> (B,) bool
-        return (self.maha(F_) <= self.tau_M) & (E_ <= self.tau_E)
+    def ood_dist(self, q):
+        """Robust-z of k-NN distance. ~0 = as in-distribution as a calib image."""
+        d = self._knn_dist(q, exclude_self=False)
+        return (d - self.d_med) / self.d_mad
 
-
-@torch.no_grad()
-def _shrinkage_precision(F_, eps=1e-5):
-    """Ledoit-Wolf-style shrinkage precision on GPU (no sklearn / no CPU copy).
-    Shrinks empirical covariance toward a scaled identity, then inverts."""
-    N, D = F_.shape
-    mu = F_.mean(0)
-    Xc = F_ - mu
-    cov = (Xc.t() @ Xc) / max(N - 1, 1)                  # (D,D)
-    alpha = 0.0
-    I = torch.eye(D, device=F_.device, dtype=F_.dtype)
-    if N <= D:
-        mu_t = cov.diagonal().mean()
-        # closed-form LW shrinkage intensity (batched, on GPU)
-        var_cov = (((Xc.unsqueeze(2) * Xc.unsqueeze(1)) ** 2).mean(0).sum()) / N
-        denom = ((cov - mu_t * I) ** 2).sum()
-        alpha = float(torch.clamp(var_cov / (denom + eps), 0.0, 1.0))
-        cov = (1 - alpha) * cov + alpha * mu_t * I
-    cov = cov + eps * I
-    return mu, torch.linalg.inv(cov), alpha
+    def passes(self, q):
+        return self._knn_dist(q, exclude_self=False) <= self.tau
 
 
 @torch.no_grad()
-def calibrate_band(model, calib_batches, hook, quantile=0.95, force_diag=False):
-    feats, energies = [], []
+def calibrate_band(model, calib_batches, hook, k=5, quantile=0.95):
+    feats = []
     for xb in calib_batches:
-        f, e = fwd_feats_energy(model, xb, hook)
-        feats.append(f); energies.append(e)
-    F_ = torch.cat(feats, 0)                             # (N,D) on GPU
-    E_ = torch.cat(energies, 0)                          # (N,)
+        f, _ = fwd_feats_logits(model, xb, hook)
+        feats.append(f)
+    F_ = torch.cat(feats, 0)                             # (N,D)
+    F_ = F.normalize(F_, dim=1)                          # cosine-geometry kNN
     N, D = F_.shape
+    k = min(k, max(1, N - 1))
 
-    if force_diag or N < 8:
-        mu = F_.mean(0)
-        prec = 1.0 / (F_.var(0) + 1e-5)                  # (D,) diagonal
-        diag = True
-        print(f"[calib] diagonal covariance (N={N}, D={D})")
-    else:
-        mu, prec, alpha = _shrinkage_precision(F_)
-        diag = False
-        print(f"[calib] shrinkage cov alpha={alpha:.3f} (N={N}, D={D})")
-
-    band = ManifoldBand(mu, prec, torch.tensor(0., device=F_.device),
-                        torch.tensor(0., device=F_.device), diag)
-    M_cal = band.maha(F_)                                # in-sample (see note)
-    band.tau_M = torch.quantile(M_cal, quantile)
-    band.tau_E = torch.quantile(E_, quantile)
-    print(f"[calib] tau_M={band.tau_M:.2f} tau_E={band.tau_E:.3f} (q{quantile})")
+    band = KNNBand(F_, k, 0.0, 1.0, 0.0)
+    # leave-one-out: each calib point's distance to its k nearest OTHERS
+    d_loo = band._knn_dist(F_, exclude_self=True)        # (N,)
+    band.d_med = float(d_loo.median())
+    band.d_mad = float((d_loo - d_loo.median()).abs().median() + 1e-6)
+    band.tau = float(d_loo.quantile(quantile))
+    print(f"[calib] N={N} D={D} k={k}  kNN: d_med={band.d_med:.4f} "
+          f"tau={band.tau:.4f} (q{quantile})")
     return band
 
 
@@ -171,7 +173,7 @@ def load_calib_batches(folder, device, batch_size=16, pattern="*.JPEG"):
             batches.append(torch.cat(buf, 0)); buf = []
     if buf:
         batches.append(torch.cat(buf, 0))
-    return batches                                       # list of GPU tensors
+    return batches
 
 
 @torch.no_grad()
@@ -186,54 +188,65 @@ def sample_masks(n, shape, p_keep, gen, device):
 @dataclass
 class CandidateScore:
     mode: str
-    on_manifold: float
-    f_b: float
-    entropy: float
-    removal: float
+    ood_dist: float             # mean k-NN OOD distance (LOWER better)
+    pass_rate: float            # fraction of composites inside the band
+    f_b: float                  # target prob on reference (lower better)
+    entropy: float              # softmax entropy of reference (HIGHER = neutral)
+    removal: float              # f_x - f_b (higher better)
     score: float = 0.0
 
 
 @torch.no_grad()
 def score_candidate(model, band, hook, calib_batches, mode, device,
                     sigma, n_masks, p_keep, gen):
-    pass_n = tot = 0
+    ood_sum = 0.0
+    pass_n = comp_n = 0
     fb_sum = ent_sum = rem_sum = 0.0
     n_img = 0
     for xb in calib_batches:
         B = xb.shape[0]; n_img += B
-        logits = model(xb)
+        feats_x, logits = fwd_feats_logits(model, xb, hook)
         tgt = logits.argmax(1)                           # (B,)
         f_x = F.softmax(logits, 1).gather(1, tgt[:, None]).squeeze(1)
 
         refs = make_reference_batched(xb, mode=mode, sigma=sigma, gen=gen)
-        pr = F.softmax(model(refs), 1)
+        _, rlogits = fwd_feats_logits(model, refs, hook)
+        pr = F.softmax(rlogits, 1)
         f_b = pr.gather(1, tgt[:, None]).squeeze(1)
         ent = -(pr * (pr + 1e-12).log()).sum(1)
         fb_sum += f_b.sum().item()
         ent_sum += ent.sum().item()
         rem_sum += (f_x - f_b).sum().item()
 
-        # stack all masks into one big batch -> single forward per image-batch
-        m = sample_masks(n_masks * B, xb.shape, p_keep, gen, device)  # (n*B,1,H,W)
-        xrep = xb.repeat(n_masks, 1, 1, 1)               # (n*B,3,H,W)
+        # all masks in one stacked batch -> single forward per image-batch
+        m = sample_masks(n_masks * B, xb.shape, p_keep, gen, device)
+        xrep = xb.repeat(n_masks, 1, 1, 1)
         rrep = refs.repeat(n_masks, 1, 1, 1)
         xp = m * xrep + (1 - m) * rrep
-        f, e = fwd_feats_energy(model, xp, hook)
-        pass_n += int(band.passes(f, e).sum().item())
-        tot += xp.shape[0]
+        fcomp, _ = fwd_feats_logits(model, xp, hook)
+        ood_sum += band.ood_dist(fcomp).sum().item()     # continuous, key signal
+        pass_n += int(band.passes(fcomp).sum().item())
+        comp_n += xp.shape[0]
 
-    return CandidateScore(mode, pass_n / max(tot, 1),
-                          fb_sum / n_img, ent_sum / n_img, rem_sum / n_img)
+    return CandidateScore(
+        mode=mode,
+        ood_dist=ood_sum / max(comp_n, 1),
+        pass_rate=pass_n / max(comp_n, 1),
+        f_b=fb_sum / n_img, entropy=ent_sum / n_img, removal=rem_sum / n_img,
+    )
 
 
 @torch.no_grad()
 def get_infill_ind(model, band, hook, calib_batches, candidates, device,
                    sigma=50.0, n_masks=8, p_keep=0.5, seed=0,
-                   w_manifold=1.0, w_neutral=1.0, w_removal=0.5,
+                   w_ood=1.0, w_neutral=0.2, w_removal=0.5,
                    neutral_cap=None, verbose=True):
     """Score each candidate infill, return (best_index, ranked_scores).
 
-    score = w_manifold*on_manifold - w_neutral*f_b + w_removal*removal
+    score = - w_ood*ood_dist + w_neutral*entropy + w_removal*removal
+      ood_dist : k-NN feature distance (lower better) -> enters with minus
+      entropy  : reference logit flatness (higher = more neutral) -> plus
+      removal  : f_x - f_b (higher better) -> plus
     neutral_cap: hard f_b ceiling; candidates above it are disqualified first.
     """
     gen = torch.Generator(device=device).manual_seed(seed)
@@ -241,13 +254,15 @@ def get_infill_ind(model, band, hook, calib_batches, candidates, device,
     for mode in candidates:
         s = score_candidate(model, band, hook, calib_batches, mode, device,
                              sigma, n_masks, p_keep, gen)
-        s.score = w_manifold * s.on_manifold - w_neutral * s.f_b \
-                  + w_removal * s.removal
+        s.score = (-w_ood * s.ood_dist
+                   + w_neutral * s.entropy
+                   + w_removal * s.removal)
         scores.append(s)
         if verbose:
-            print(f"[score] {mode:8s} on_manifold={s.on_manifold:6.2%} "
-                  f"f_b={s.f_b:6.3f} H={s.entropy:6.3f} "
-                  f"removal={s.removal:+6.3f} -> {s.score:+.4f}")
+            print(f"[score] {mode:8s} ood={s.ood_dist:+7.3f} "
+                  f"pass={s.pass_rate:5.1%} f_b={s.f_b:6.3f} "
+                  f"H={s.entropy:6.3f} removal={s.removal:+6.3f} "
+                  f"-> {s.score:+.4f}")
 
     elig = list(range(len(scores)))
     if neutral_cap is not None:
@@ -273,13 +288,12 @@ def main():
     ap.add_argument("--batch_size", type=int, default=16)
     ap.add_argument("--n_masks", type=int, default=8)
     ap.add_argument("--p_keep", type=float, default=0.5)
+    ap.add_argument("--k", type=int, default=5, help="k for k-NN OOD distance")
     ap.add_argument("--quantile", type=float, default=0.95)
-    ap.add_argument("--w_manifold", type=float, default=1.0)
-    ap.add_argument("--w_neutral", type=float, default=1.0)
+    ap.add_argument("--w_ood", type=float, default=1.0)
+    ap.add_argument("--w_neutral", type=float, default=0.2)
     ap.add_argument("--w_removal", type=float, default=0.5)
     ap.add_argument("--neutral_cap", type=float, default=None)
-    ap.add_argument("--force_diag", action="store_true",
-                    help="force diagonal covariance (fastest, crudest)")
     ap.add_argument("--device",
                     default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -292,13 +306,13 @@ def main():
 
     calib = load_calib_batches(args.calib, args.device,
                                args.batch_size, args.pattern)
-    band = calibrate_band(model, calib, hook, args.quantile, args.force_diag)
+    band = calibrate_band(model, calib, hook, k=args.k, quantile=args.quantile)
 
     best, scores = get_infill_ind(
         model, band, hook, calib, args.candidates, args.device,
         sigma=args.sigma, n_masks=args.n_masks, p_keep=args.p_keep,
-        w_manifold=args.w_manifold, w_neutral=args.w_neutral,
-        w_removal=args.w_removal, neutral_cap=args.neutral_cap,
+        w_ood=args.w_ood, w_neutral=args.w_neutral, w_removal=args.w_removal,
+        neutral_cap=args.neutral_cap,
     )
     hook.remove()
     print(f"\nBest infill: {scores[best].mode}")
