@@ -32,7 +32,7 @@ from xai_suff.explainers import (
     LIMEExplainer,
     SufficiencyExplainer,
     PyramidExplainer,
-    blur_reference,
+    make_reference,
 )
 
 METHODS = {
@@ -51,7 +51,7 @@ def _normalize_map(a: np.ndarray, signed: bool) -> np.ndarray:
     return (a - lo) / (hi - lo + 1e-12)  # [0,1]
 
 
-def _save_panel(out_path, x_norm, b_norm, result):
+def _save_panel(out_path, x_norm, b_norm, result,infill="blur"):
     img = denormalize(x_norm)[0].permute(1, 2, 0).cpu().numpy()
     blur = denormalize(b_norm)[0].permute(1, 2, 0).cpu().numpy()
     a = result.attribution
@@ -61,7 +61,7 @@ def _save_panel(out_path, x_norm, b_norm, result):
 
     fig, ax = plt.subplots(1, 4, figsize=(16, 4))
     ax[0].imshow(img); ax[0].set_title("input"); ax[0].axis("off")
-    ax[1].imshow(blur); ax[1].set_title("blur reference b"); ax[1].axis("off")
+    ax[1].imshow(blur); ax[1].set_title(f"{infill} reference b"); ax[1].axis("off")
     im = ax[2].imshow(amap, cmap=cmap, vmin=(-1 if signed else 0), vmax=1)
     ax[2].set_title(f"{result.method} attribution"); ax[2].axis("off")
     fig.colorbar(im, ax=ax[2], fraction=0.046)
@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--stochastic", action="store_true",
                     help="use Bernoulli-sampled masks in the sufficiency method")
+    ap.add_argument("--infill", default="blur",
+                    choices=["blur", "black", "white", "noise", "corners"],
+                    help="reference/infill mode (default: blur)")
     args = ap.parse_args()
 
     os.makedirs(args.out, exist_ok=True)
@@ -101,8 +104,7 @@ def main():
     model = load_backbone(device)
     class_names = get_class_names()
     x = load_image(args.image, device)
-    b = blur_reference(x, args.sigma)
-
+    b = make_reference(x, mode=args.infill, sigma=args.sigma)
     with torch.no_grad():
         top1 = int(model(x).argmax(1).item())
     target = args.target if args.target is not None else top1
@@ -110,11 +112,12 @@ def main():
 
     summary_lines = [f"image: {args.image}",
                      f"target: {target} ({class_names[target]})",
-                     f"sigma: {args.sigma}", ""]
+                     f"sigma: {args.sigma}",
+                     f"infill: {args.infill}", ""]
 
     for name in args.methods:
         kwargs = dict(target_class=target, device=device, class_names=class_names,
-                      sigma=args.sigma)
+                      sigma=args.sigma, infill=args.infill)
         if name == "sufficiency":
             kwargs["stochastic"] = args.stochastic
         explainer = METHODS[name](model, **kwargs)
@@ -122,7 +125,7 @@ def main():
         result = explainer.explain(x)
 
         out_path = os.path.join(args.out, f"{name}.png")
-        _save_panel(out_path, x, b, result)
+        _save_panel(out_path, x, b, result, infill=args.infill)
         print(f"[explain]   -> {out_path}")
 
         line = f"{name}: f_x={result.f_x:.4f}"
