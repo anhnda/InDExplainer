@@ -4,6 +4,7 @@ from .lime import LIMEExplainer
 from .sufficiency import SufficiencyExplainer
 from .pyramid import PyramidExplainer
 from .hessianig import HessianIGExplainer
+from .hime import HIMEExplainer
 __all__ = [
     "AttributionResult",
     "Explainer",
@@ -13,4 +14,5 @@ __all__ = [
     "SufficiencyExplainer",
     "PyramidExplainer",
     "HessianIGExplainer",
+    "HIMEExplainer",
 ]
