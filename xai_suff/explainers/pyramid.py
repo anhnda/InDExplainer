@@ -98,6 +98,11 @@ class PyramidExplainer(Explainer):
         k_lime: int = 10,                  # number of top-LIME leaves used to seed S
         full_lime: bool = False,          # if True: ENTIRE chain follows LIME rank,
                                           # greedy phase skipped (ablation/control)
+        # --- greedy selection signal ------------------------------------ #
+        select_mode: str = "insertion",   # "insertion" (default, original v(S) rule)
+                                          # or "both" (weighted insertion+deletion)
+        both_alpha: float = 0.5,          # weight on insertion in "both" mode;
+                                          # selection = a*v_ins + (1-a)*v_del
         lime_n_samples: int = 1000,       # LIME perturbation samples
         lime_kernel_width: float = 0.25,  # LIME locality kernel width
         lime_alpha: float = 1.0,          # LIME ridge regularization
@@ -125,6 +130,10 @@ class PyramidExplainer(Explainer):
         self.value_mode = value_mode
         self.k_lime = int(k_lime)
         self.full_lime = bool(full_lime)
+        if select_mode not in ("insertion", "both"):
+            raise ValueError(f"select_mode must be 'insertion' or 'both', got {select_mode!r}")
+        self.select_mode = select_mode
+        self.both_alpha = float(both_alpha)
         self.lime_n_samples = lime_n_samples
         self.lime_kernel_width = lime_kernel_width
         self.lime_alpha = lime_alpha
@@ -204,6 +213,46 @@ class PyramidExplainer(Explainer):
     def _value_of_mask(self, mask_bool, x, b, x0_val: float, target: int) -> float:
         """Single-mask convenience wrapper around the batched path."""
         return float(self._values_of_masks([mask_bool], x, b, x0_val, target)[0])
+
+    def _deletion_drops(
+        self, masks_bool, x: torch.Tensor, b: torch.Tensor, f_x: float, target: int
+    ) -> np.ndarray:
+        """Deletion-drop score for each (H,W) bool mask S (the IMPORTANT/kept set).
+
+        Deletion removes S from the full sharp image: pixels IN S take the removal
+        field, pixels OUTSIDE S stay sharp. The score is how far the target prob
+        falls from the full-image value:
+
+            del_drop(S) = f(x) - f( S->removal_field , complement->sharp )
+
+        Same removal field as insertion (the blur reference `b`), per the "both"
+        construction choice. Larger S removes more, so del_drop grows monotonically
+        with S toward ~f(x) - f(x0) -- same scale and direction as v_ins, so a
+        weighted sum a*v_ins + (1-a)*del_drop is dimensionally clean.
+
+        NOTE: this is the deletion DROP (bigger = the set is more necessary). It is
+        used ONLY as a selection signal in `both` mode; it is never stored as a
+        node value, so Theorem 1 (which telescopes the insertion v) is untouched.
+        """
+        if len(masks_bool) == 0:
+            return np.empty(0, dtype=np.float64)
+        marr = np.stack([np.asarray(m, dtype=bool) for m in masks_bool])  # (N,H,W)
+        n = marr.shape[0]
+        out_scores = np.empty(n, dtype=np.float64)
+        with torch.no_grad():
+            for start in range(0, n, self.max_batch):
+                chunk = marr[start:start + self.max_batch]
+                m = torch.as_tensor(chunk, dtype=x.dtype, device=x.device)  # (b,H,W)
+                m = m.unsqueeze(1)                                          # (b,1,H,W)
+                # IN S -> removal field b ; OUTSIDE S -> sharp x   (opposite of Phi)
+                comps = (1.0 - m) * x + m * b                              # (b,C,H,W)
+                out = self.model(comps)
+                if self.value_mode == "logit":
+                    s = out[:, target]
+                else:
+                    s = F.softmax(out, dim=1)[:, target]
+                out_scores[start:start + chunk.shape[0]] = s.detach().cpu().numpy()
+        return f_x - out_scores
 
     # ------------------------------------------------------------------ #
     # leaf segmentation: SLIC (default) or fixed grid
@@ -290,7 +339,7 @@ class PyramidExplainer(Explainer):
     # ------------------------------------------------------------------ #
     # LIME-seeded nested greedy-add-leaf chain on the joint score v(union)
     # ------------------------------------------------------------------ #
-    def _build_tree(self, img01, labels, x, b, x0_val: float, target: int):
+    def _build_tree(self, img01, labels, x, b, x0_val: float, target: int, f_x: float):
         """Grow one nested coalition: seed with the top-`k_lime` LIME leaves (in
         LIME order), then greedily add the leaf that most increases v(S u {l}).
 
@@ -383,7 +432,14 @@ class PyramidExplainer(Explainer):
 
         # ---- greedy phase: batched full-evaluation per step ----------- #
         # Skipped entirely in full_lime mode (in_set already == all leaves).
+        # select_mode controls WHICH leaf is picked each step:
+        #   "insertion": argmax v_ins(S u {l})            (original rule)
+        #   "both"     : argmax [ a*v_ins + (1-a)*del_drop ]
+        # In BOTH cases the node value stored is the insertion v(S u {l}), so the
+        # telescoping decomposition (Theorem 1) is identical across modes; only
+        # the leaf ORDER differs.
         if not self.full_lime:
+            a = self.both_alpha
             while len(in_set) < len(uniq):
                 remaining = [l for l in uniq if l not in in_set]
                 # build one candidate union mask per remaining leaf, score in batch
@@ -391,10 +447,17 @@ class PyramidExplainer(Explainer):
                 cand_v = self._values_of_masks(cand_masks, x, b, x0_val, target)
                 n_fresh_q += len(remaining)
 
-                best_idx = int(np.argmax(cand_v))   # argmax of v(S u {l})
+                if self.select_mode == "both":
+                    cand_del = self._deletion_drops(cand_masks, x, b, f_x, target)
+                    n_fresh_q += len(remaining)
+                    select_score = a * cand_v + (1.0 - a) * cand_del
+                else:
+                    select_score = cand_v
+
+                best_idx = int(np.argmax(select_score))  # argmax of selection signal
                 l = remaining[best_idx]
                 best_union_mask = cand_masks[best_idx]
-                best_union_v = float(cand_v[best_idx])
+                best_union_v = float(cand_v[best_idx])    # stored value is ALWAYS v_ins
 
                 leaf_child = leaf_node[l]
                 merged = _Node(
@@ -594,7 +657,7 @@ class PyramidExplainer(Explainer):
         x0_val = f_b
 
         labels = self._leaf_labels(img01)
-        root, tinfo = self._build_tree(img01, labels, x, b, x0_val, target)
+        root, tinfo = self._build_tree(img01, labels, x, b, x0_val, target, f_x)
 
         leaves, internals, _ = self._collect(root)
         leaf_masks = {leaf.id: leaf.mask for leaf in leaves}
@@ -676,6 +739,8 @@ class PyramidExplainer(Explainer):
                 "n_internal": len(internals),
                 "merge_rule": ("lime_full_order" if self.full_lime
                                else "lime_seeded_nested_greedy_joint_score"),
+                "select_mode": self.select_mode,
+                "both_alpha": self.both_alpha,
                 # LIME prior
                 "k_lime": self.k_lime,
                 "k_lime_used": tinfo["k_lime_used"],
