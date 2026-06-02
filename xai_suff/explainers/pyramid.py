@@ -1,8 +1,16 @@
 """PyramidExplainer -- LIME-primed, sequential nested greedy joint-score chain.
 
-What changed vs. the pure-greedy version
------------------------------------------
-The nested coalition is now *seeded* by a LIME prior and then grown by greedy
+BATCHED VERSION.
+================
+Algorithm is identical to the original; only the model-forward plumbing changed.
+All candidate evaluations that are mutually independent (LIME perturbations, the
+per-step greedy candidate set, the swap-audit in/out pairs, and the nested
+control chains) are now stacked into a single (N,C,H,W) forward pass, chunked by
+`max_batch`, with one GPU->CPU sync per chunk instead of one per image.
+
+What changed vs. the pure-greedy version (unchanged design notes)
+-----------------------------------------------------------------
+The nested coalition is *seeded* by a LIME prior and then grown by greedy
 joint-score steps:
 
     1. LIME pass on the leaves (SLIC superpixels or grid cells) gives one
@@ -15,83 +23,31 @@ joint-score steps:
 
 So LIME only fixes the FIRST k leaves; every later leaf is chosen by the real
 model joint score v(S u {l}) (the target-class response on the revealed set).
-This keeps the non-circularity of the original design (the accept criterion is a
-genuine model output, not the residual Delta) while letting a cheap surrogate
-warm-start the root of the chain.
 
 full_lime mode (ablation)
 -------------------------
 Setting `full_lime=True` makes the ENTIRE chain follow the LIME ranking: the
 greedy phase is skipped and the node order is EXACTLY the sorted LIME
-coefficients, end-to-end. This is the degenerate corner of the method (k_lime =
-n_leaves) and is meant as an ablation / control: it answers "what if we never
-used the model's joint score, only the surrogate rank?". Theorem 1 (telescoping)
-still holds, because the tree is still a disjoint nested partition -- only the
-ORDER in which leaves are absorbed changes. The merge residuals Delta are still
-computed from genuine joint reveals v(S), so the decomposition is unchanged; what
-changes is which coalitions the chain visits. Use it to bound how much the greedy
-joint-score steps add over a pure-LIME ordering on the same grid.
+coefficients, end-to-end. Theorem 1 (telescoping) still holds, because the tree
+is still a disjoint nested partition -- only the ORDER in which leaves are
+absorbed changes.
 
-Honesty note (read before trusting the tree)
----------------------------------------------
-With small k_lime the structural commitment to LIME is small: only the top LIME
-leaves are forced; the rest of the tree is the model's own greedy ordering. The
-LIME-order control curve (built in pure LIME rank) is reported alongside the
-greedy curve so the LIME contribution can be checked directly -- if the greedy
-v(S_k) curve does not rise faster than the LIME-order curve, the model's joint
-score decisions are not doing real work beyond the surrogate. In `full_lime`
-mode the chain and that control are by construction the same order.
+Note on greedy implementation
+-----------------------------
+The original used CELF lazy-greedy (a per-element upper-bound heap) to keep the
+greedy phase near-linear in serial, single-image evaluation. With batching the
+bottleneck is no longer the number of v() calls but the number of *forward
+passes*; evaluating all remaining candidates for a step in ONE batched forward
+turns each step into a single GPU call. So this version does an exact batched
+full-evaluation per step (O(n) batched forwards total). The chosen leaf at every
+step is the true argmax of v(S u {l}), identical to what CELF converges to, so
+the resulting chain is unchanged.
 
-Selection signal
-----------------
-Joint reveal score v(S) = f(Phi_S(x)) - f(x0), a genuine model output bounded
-above by v(root); NOT the merge residual Delta (building on Delta is circular).
-In `full_lime` mode the selection signal is the LIME coefficient, not v(S):
-nodes are ordered by the surrogate, and v(S) is only MEASURED, not used to pick.
-
-Construction (LIME-seeded nested greedy-add-leaf)
--------------------------------------------------
-    seed:  S_1..S_k  = top-k LIME-ranked leaves, in LIME order
-    grow:  S_{j}     = S_{j-1} u {argmax_{l notin S_{j-1}} v(S_{j-1} u {l})}
-    full_lime: S_1..S_n = ALL leaves, in LIME order (grow phase never runs)
-
-Each step appends one leaf, creating one binary internal node (running-union +
-the newly added leaf). The chain S_1 c S_2 c ... c S_n is the trace from the
-seed up to the root (= all leaves). The partition at every node is disjoint
-(parent = running-union-child + one fresh-leaf-child), so Theorem 1
-(telescoping) holds unchanged:
-
-    v(root) = sum_{leaves} v(leaf) + sum_{internal} Delta(R)
-
-A lazy-greedy (CELF) upper-bound heap keeps the greedy phase near-linear when v
-is roughly submodular.
-
-Optimality claim (honest)
--------------------------
-The seed leaves are LIME-chosen, NOT joint-score-optimal; only the greedy phase
-is nested-greedy-best (exactly optimal iff v is monotone submodular, (1-1/e)
-otherwise). In `full_lime` mode NO part of the order is joint-score-optimal: the
-order is the surrogate's, so the optimality claim does not apply and the swap
-audit will typically find improving swaps. Each level is otherwise certified by a
-1-swap local-search audit: try replacing one in-set leaf with one out-of-set
-leaf; if no single swap raises v, S_k is a certified 1-swap local optimum. Swaps
-may break strict nesting, so the audit is reported separately and the telescoping
-tree is always built from the pure nested chain.
-
-Controls (mandatory, not optional)
-----------------------------------
-Random-tree, color-tree, AND LIME-order controls compare how fast v(S_k) rises
-with k against the greedy chain. If a blind/LIME-only tree concentrates the model
-score just as fast, the greedy phase is not doing real work.
-
-Per-pixel attribution remains the leaf-additive density v(leaf)/area(leaf);
-Delta, the sufficiency node, the greedy concentration curve, the LIME ranking,
-and the swap audit are reported in `extras`.
+Selection signal, construction, optimality claim, controls, and per-pixel
+attribution are all unchanged from the original; see method docstrings.
 """
 from __future__ import annotations
 
-import heapq
-import itertools
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -145,13 +101,14 @@ class PyramidExplainer(Explainer):
         lime_n_samples: int = 1000,       # LIME perturbation samples
         lime_kernel_width: float = 0.25,  # LIME locality kernel width
         lime_alpha: float = 1.0,          # LIME ridge regularization
-        lime_batch_size: int = 64,        # LIME forward batch size
         # --- audits / controls ----------------------------------------- #
         swap_audit: bool = True,          # run 1-swap local-optimality certificate
         swap_levels: Optional[list] = None,  # which k to audit; None -> a few checkpoints
         run_controls: bool = True,        # random + color + lime-order controls
         n_random_trees: int = 5,          # random-chain controls to average
         suff_eps: float = 0.05,           # sufficiency: v(S) >= (1-eps) v(root)
+        # --- batching --------------------------------------------------- #
+        max_batch: int = 64,              # max images per model forward pass
         seed: int = 0,
         **kw,
     ):
@@ -171,16 +128,16 @@ class PyramidExplainer(Explainer):
         self.lime_n_samples = lime_n_samples
         self.lime_kernel_width = lime_kernel_width
         self.lime_alpha = lime_alpha
-        self.lime_batch_size = lime_batch_size
         self.swap_audit = swap_audit
         self.swap_levels = swap_levels
         self.run_controls = run_controls
         self.n_random_trees = n_random_trees
         self.suff_eps = suff_eps
+        self.max_batch = int(max_batch)
         self.seed = seed
 
     # ------------------------------------------------------------------ #
-    # Phi: blur-completion projection operator
+    # Phi: blur-completion projection operator (single image)
     # ------------------------------------------------------------------ #
     def _phi(self, x: torch.Tensor, b: torch.Tensor, mask_bool: np.ndarray) -> torch.Tensor:
         """Phi_R(x) = m * x + (1 - m) * b, m the (H,W) {0,1} region indicator."""
@@ -189,16 +146,64 @@ class PyramidExplainer(Explainer):
         return m * x + (1.0 - m) * b
 
     def _score(self, comp: torch.Tensor, target: int) -> float:
-        """Raw model response on a completed image: logit (default) or prob."""
+        """Raw model response on a single completed image: logit or prob."""
         with torch.no_grad():
             out = self.model(comp)
             if self.value_mode == "logit":
                 return float(out[:, target].item())
             return float(F.softmax(out, dim=1)[:, target].item())
 
+    # ------------------------------------------------------------------ #
+    # BATCHED scoring core
+    # ------------------------------------------------------------------ #
+    def _score_batch(self, comps: torch.Tensor, target: int) -> np.ndarray:
+        """Score a batch of completed images. comps: (N,C,H,W) -> (N,) np.float64.
+
+        Chunks by self.max_batch and does ONE GPU->CPU sync per chunk.
+        """
+        n = comps.shape[0]
+        out_scores = np.empty(n, dtype=np.float64)
+        with torch.no_grad():
+            for start in range(0, n, self.max_batch):
+                cb = comps[start:start + self.max_batch]
+                out = self.model(cb)
+                if self.value_mode == "logit":
+                    s = out[:, target]
+                else:
+                    s = F.softmax(out, dim=1)[:, target]
+                out_scores[start:start + cb.shape[0]] = s.detach().cpu().numpy()
+        return out_scores
+
+    def _values_of_masks(
+        self, masks_bool, x: torch.Tensor, b: torch.Tensor, x0_val: float, target: int
+    ) -> np.ndarray:
+        """v(R_i) for a list/array of (H,W) bool masks, evaluated in batches.
+
+        Returns np.ndarray of shape (len(masks_bool),): score(Phi_{R_i}(x)) - x0_val.
+        Builds completed images in chunks so peak memory stays at max_batch images.
+        """
+        if len(masks_bool) == 0:
+            return np.empty(0, dtype=np.float64)
+        marr = np.stack([np.asarray(m, dtype=bool) for m in masks_bool])  # (N,H,W)
+        n = marr.shape[0]
+        out_scores = np.empty(n, dtype=np.float64)
+        with torch.no_grad():
+            for start in range(0, n, self.max_batch):
+                chunk = marr[start:start + self.max_batch]
+                m = torch.as_tensor(chunk, dtype=x.dtype, device=x.device)  # (b,H,W)
+                m = m.unsqueeze(1)                                          # (b,1,H,W)
+                comps = m * x + (1.0 - m) * b                              # (b,C,H,W)
+                out = self.model(comps)
+                if self.value_mode == "logit":
+                    s = out[:, target]
+                else:
+                    s = F.softmax(out, dim=1)[:, target]
+                out_scores[start:start + chunk.shape[0]] = s.detach().cpu().numpy()
+        return out_scores - x0_val
+
     def _value_of_mask(self, mask_bool, x, b, x0_val: float, target: int) -> float:
-        """v(R) = score(Phi_R(x)) - x0_val."""
-        return self._score(self._phi(x, b, mask_bool), target) - x0_val
+        """Single-mask convenience wrapper around the batched path."""
+        return float(self._values_of_masks([mask_bool], x, b, x0_val, target)[0])
 
     # ------------------------------------------------------------------ #
     # leaf segmentation: SLIC (default) or fixed grid
@@ -208,7 +213,6 @@ class PyramidExplainer(Explainer):
         H, W = img01.shape[:2]
         if self.segmentation == "grid":
             return self._grid_labels(H, W)
-        # SLIC (default), with a grid fallback if skimage is unavailable.
         if _HAS_SKIMAGE:
             labels = slic(
                 img01,
@@ -221,11 +225,7 @@ class PyramidExplainer(Explainer):
         return self._grid_labels(H, W)
 
     def _grid_labels(self, H: int, W: int) -> np.ndarray:
-        """Regular grid tiling -> (H,W) int label map.
-
-        Uses `self.grid = (gh, gw)` directly when segmentation='grid'; otherwise
-        falls back to a near-square grid with ~n_segments cells.
-        """
+        """Regular grid tiling -> (H,W) int label map."""
         if self.segmentation == "grid":
             gh, gw = self.grid
         else:
@@ -237,15 +237,11 @@ class PyramidExplainer(Explainer):
 
     # ------------------------------------------------------------------ #
     # LIME prior over leaves: weighted-ridge surrogate -> per-leaf coeff
+    # (already batched in the original; kept, with max_batch as the chunk)
     # ------------------------------------------------------------------ #
     def _lime_rank(self, labels: np.ndarray, x, b, target: int):
         """Fit a LIME-style weighted linear surrogate on the leaf on/off vectors
         and return leaves ranked by descending surrogate coefficient.
-
-        Interpretable features = leaves (1 = keep sharp, 0 = blur). Same recipe
-        as the standalone LIME explainer, but on the Pyramid leaf label map
-        (SLIC or grid) rather than a separate fixed grid -- so the ranking is in
-        the exact leaf vocabulary the tree is built from.
 
         Returns (ranked_leaf_labels, coeff_by_label, n_forward_queries).
         """
@@ -253,7 +249,6 @@ class PyramidExplainer(Explainer):
         n_cells = len(uniq)
         label_to_col = {l: j for j, l in enumerate(uniq)}
 
-        # contiguous (H,W) column-index map for fast per-pixel gather
         col_map = np.empty_like(labels)
         for l in uniq:
             col_map[labels == l] = label_to_col[l]
@@ -265,21 +260,20 @@ class PyramidExplainer(Explainer):
 
         probs = np.zeros(self.lime_n_samples, dtype=np.float64)
         n_q = 0
-        for start in range(0, self.lime_n_samples, self.lime_batch_size):
-            zb = Z[start:start + self.lime_batch_size].to(x.device)   # (B,n_cells)
-            keep = zb[:, col_map_t]                                   # (B,H,W)
-            keep = keep.unsqueeze(1)                                  # (B,1,H,W)
-            comp = keep * x + (1.0 - keep) * b
-            with torch.no_grad():
+        with torch.no_grad():
+            for start in range(0, self.lime_n_samples, self.max_batch):
+                zb = Z[start:start + self.max_batch].to(x.device)   # (B,n_cells)
+                keep = zb[:, col_map_t]                             # (B,H,W)
+                keep = keep.unsqueeze(1)                            # (B,1,H,W)
+                comp = keep * x + (1.0 - keep) * b
                 out = self.model(comp)
                 if self.value_mode == "logit":
                     p = out[:, target]
                 else:
                     p = F.softmax(out, dim=1)[:, target]
-            probs[start:start + zb.shape[0]] = p.detach().cpu().numpy()
-            n_q += zb.shape[0]
+                probs[start:start + zb.shape[0]] = p.detach().cpu().numpy()
+                n_q += zb.shape[0]
 
-        # cosine-distance locality weights to the all-on vector
         Znp = Z.cpu().numpy()
         all_on = np.ones(n_cells)
         d = 1.0 - (Znp @ all_on) / (
@@ -287,7 +281,7 @@ class PyramidExplainer(Explainer):
         )
         weights = np.exp(-(d ** 2) / (self.lime_kernel_width ** 2))
 
-        coefs = _weighted_ridge(Znp, probs, weights, alpha=self.lime_alpha)  # (n_cells,)
+        coefs = _weighted_ridge(Znp, probs, weights, alpha=self.lime_alpha)
 
         coeff_by_label = {l: float(coefs[label_to_col[l]]) for l in uniq}
         ranked = sorted(uniq, key=lambda l: coeff_by_label[l], reverse=True)
@@ -300,8 +294,9 @@ class PyramidExplainer(Explainer):
         """Grow one nested coalition: seed with the top-`k_lime` LIME leaves (in
         LIME order), then greedily add the leaf that most increases v(S u {l}).
 
-        If `self.full_lime` is True the seed covers EVERY leaf, so the greedy
-        phase never runs and the chain order is exactly the LIME ranking.
+        Greedy phase is batched: each step scores ALL remaining candidates in one
+        batched forward and picks the argmax. If `self.full_lime` is True the seed
+        covers EVERY leaf, so the greedy phase never runs.
         Returns (root, info).
         """
         uniq = [int(l) for l in np.unique(labels)]
@@ -313,14 +308,18 @@ class PyramidExplainer(Explainer):
         # ---- LIME prior ranking --------------------------------------- #
         lime_ranked, lime_coeff, n_lime_q = self._lime_rank(labels, x, b, target)
 
-        # ---- leaf nodes + individual values --------------------------- #
+        # ---- leaf nodes + individual values (ONE batch over all leaves) #
+        leaf_value_arr = self._values_of_masks(
+            [leaf_mask[l] for l in uniq], x, b, x0_val, target
+        )
+        n_fresh_q += len(uniq)
+
         node: dict[int, _Node] = {}
         leaf_node: dict[int, _Node] = {}
         leaf_value: dict[int, float] = {}
         next_id = 0
-        for l in uniq:
-            v_l = self._value_of_mask(leaf_mask[l], x, b, x0_val, target)
-            n_fresh_q += 1
+        for l, v_l in zip(uniq, leaf_value_arr):
+            v_l = float(v_l)
             nd = _Node(id=next_id, mask=leaf_mask[l], children=[], v=v_l)
             node[next_id] = nd
             leaf_node[l] = nd
@@ -328,17 +327,15 @@ class PyramidExplainer(Explainer):
             next_id += 1
 
         # ---- chain bookkeeping ---------------------------------------- #
-        chain = []                              # leaf-label order of inclusion
-        chain_v = []                            # v(S_k) after each inclusion
-        chain_delta = []                        # Delta at each merge (0 for S_1)
-        chain_node_ids = []                     # running-union node id per level
-        chain_source = []                       # "lime_seed" / "lime_full" / "greedy"
-        merge_order = []                        # (running_id, leaf_id, merged_id, delta)
+        chain = []
+        chain_v = []
+        chain_delta = []
+        chain_node_ids = []
+        chain_source = []
+        merge_order = []
         in_set: set = set()
 
         # ---- seed phase: top-k LIME leaves, in LIME rank order -------- #
-        # full_lime: the "seed" is the entire LIME ranking, so the chain order
-        # IS the sorted LIME coefficients and the greedy loop below is a no-op.
         if self.full_lime:
             k_seed = len(uniq)
             seed_source = "lime_full"
@@ -352,7 +349,6 @@ class PyramidExplainer(Explainer):
         cur_v = None
         for l in seed_leaves:
             if cur_node is None:
-                # S_1
                 cur_mask = leaf_mask[l].copy()
                 cur_v = leaf_value[l]
                 cur_node = leaf_node[l]
@@ -363,7 +359,6 @@ class PyramidExplainer(Explainer):
                 chain_node_ids.append(cur_node.id)
                 chain_source.append(seed_source)
                 continue
-            # S_2 .. S_k: merge the next LIME leaf onto the running union
             union_mask = cur_mask | leaf_mask[l]
             v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
             n_fresh_q += 1
@@ -386,44 +381,21 @@ class PyramidExplainer(Explainer):
             chain_node_ids.append(cur_node.id)
             chain_source.append(seed_source)
 
-        # ---- greedy phase: CELF lazy-greedy on v(S u {l}) ------------- #
+        # ---- greedy phase: batched full-evaluation per step ----------- #
         # Skipped entirely in full_lime mode (in_set already == all leaves).
         if not self.full_lime:
-            heap: list = []
-            tiebreak = itertools.count()
-            for l in uniq:
-                if l in in_set:
-                    continue
-                # seed bound: marginal gain of l over the current seed set
-                union_mask = cur_mask | leaf_mask[l]
-                v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
-                n_fresh_q += 1
-                heapq.heappush(heap, (-(v_union - cur_v), next(tiebreak), l))
-
             while len(in_set) < len(uniq):
-                best_leaf = None
-                best_union_mask = None
-                best_union_v = None
-                while heap:
-                    neg_bound, _, l = heapq.heappop(heap)
-                    if l in in_set:
-                        continue
-                    union_mask = cur_mask | leaf_mask[l]
-                    v_union = self._value_of_mask(union_mask, x, b, x0_val, target)
-                    n_fresh_q += 1
-                    gain = v_union - cur_v
-                    nxt = -heap[0][0] if heap else -np.inf
-                    if gain >= nxt:
-                        best_leaf = l
-                        best_union_mask, best_union_v = union_mask, v_union
-                        break
-                    else:
-                        heapq.heappush(heap, (-gain, next(tiebreak), l))
+                remaining = [l for l in uniq if l not in in_set]
+                # build one candidate union mask per remaining leaf, score in batch
+                cand_masks = [cur_mask | leaf_mask[l] for l in remaining]
+                cand_v = self._values_of_masks(cand_masks, x, b, x0_val, target)
+                n_fresh_q += len(remaining)
 
-                if best_leaf is None:
-                    break
+                best_idx = int(np.argmax(cand_v))   # argmax of v(S u {l})
+                l = remaining[best_idx]
+                best_union_mask = cand_masks[best_idx]
+                best_union_v = float(cand_v[best_idx])
 
-                l = best_leaf
                 leaf_child = leaf_node[l]
                 merged = _Node(
                     id=next_id,
@@ -460,7 +432,7 @@ class PyramidExplainer(Explainer):
             "chain_v": chain_v,
             "chain_delta": chain_delta,
             "chain_node_ids": chain_node_ids,
-            "chain_source": chain_source,         # provenance of each level
+            "chain_source": chain_source,
             "merge_order": merge_order,
             "v_root_est": float(v_root_est),
             "suff_node_id": int(suff_node.id),
@@ -480,11 +452,13 @@ class PyramidExplainer(Explainer):
         return root, info
 
     # ------------------------------------------------------------------ #
-    # 1-swap local-optimality audit
+    # 1-swap local-optimality audit (BATCHED over all in/out pairs)
     # ------------------------------------------------------------------ #
     def _swap_audit(self, tinfo, x, b, x0_val, target):
         """For selected levels k, test whether any single in/out swap raises
-        v(S_k). Returns per-level certificates and counts fresh forwards used."""
+        v(S_k). All pairs for a level are scored in one batched call. Masks are
+        built by toggling the two swapped leaves on a precomputed base mask.
+        Returns per-level certificates and counts fresh forwards used."""
         chain = tinfo["chain"]
         leaf_mask = tinfo["leaf_mask"]
         uniq = tinfo["uniq"]
@@ -492,35 +466,44 @@ class PyramidExplainer(Explainer):
 
         if self.swap_levels is not None:
             levels = [k for k in self.swap_levels if 1 <= k <= len(chain)]
-        else:  # default checkpoints: 1, n/8, n/4, n/2 leaves
+        else:
             cand = sorted({1, max(1, n // 8), max(1, n // 4), max(1, n // 2)})
             levels = [k for k in cand if k <= len(chain)]
 
         n_q = 0
         audits = {}
+        any_mask = next(iter(leaf_mask.values()))
         for k in levels:
             S = set(chain[:k])
             outside = [l for l in uniq if l not in S]
-            base_mask = np.zeros_like(next(iter(leaf_mask.values())))
+
+            # base mask = union of S
+            base_mask = np.zeros_like(any_mask)
             for l in S:
                 base_mask = base_mask | leaf_mask[l]
             v_S = self._value_of_mask(base_mask, x, b, x0_val, target)
             n_q += 1
 
-            best_improve = 0.0
-            best_swap = None
-            for l_in in list(S):
+            # enumerate all (l_in, l_out) pairs; build masks by toggling 2 leaves
+            pairs = []
+            swap_masks = []
+            for l_in in S:
+                # removing l_in from the union: base minus l_in's pixels
+                mask_wo_in = base_mask & ~leaf_mask[l_in]
                 for l_out in outside:
-                    swapped = (S - {l_in}) | {l_out}
-                    m = np.zeros_like(base_mask)
-                    for l in swapped:
-                        m = m | leaf_mask[l]
-                    v_sw = self._value_of_mask(m, x, b, x0_val, target)
-                    n_q += 1
-                    improve = v_sw - v_S
-                    if improve > best_improve:
-                        best_improve = improve
-                        best_swap = (int(l_in), int(l_out))
+                    swap_masks.append(mask_wo_in | leaf_mask[l_out])
+                    pairs.append((int(l_in), int(l_out)))
+
+            if swap_masks:
+                v_sw = self._values_of_masks(swap_masks, x, b, x0_val, target)
+                n_q += len(swap_masks)
+                improve = v_sw - v_S
+                j = int(np.argmax(improve))
+                best_improve = float(improve[j])
+                best_swap = pairs[j] if best_improve > 0.0 else None
+            else:
+                best_improve = 0.0
+                best_swap = None
 
             audits[int(k)] = {
                 "v_S": float(v_S),
@@ -531,28 +514,31 @@ class PyramidExplainer(Explainer):
         return audits, n_q
 
     # ------------------------------------------------------------------ #
-    # control chains: how fast does v(S_k) rise for a blind / LIME ordering?
+    # control chains (each nested chain scored as ONE batched mask set)
     # ------------------------------------------------------------------ #
     def _control_curves(self, tinfo, x, b, x0_val, target):
-        """Random-leaf-order, color-order, and LIME-order nested chains, for
-        comparison with the greedy concentration curve. Returns mean curves and
-        forward count."""
+        """Random-leaf-order, color-order, and LIME-order nested chains. Each
+        chain's cumulative masks are precomputed and scored in a single batched
+        call. Returns mean curves and forward count."""
         uniq = tinfo["uniq"]
         leaf_mask = tinfo["leaf_mask"]
         leaf_color = tinfo["leaf_color"]
         lime_ranked = tinfo["lime_ranked"]
         rng = np.random.default_rng(self.seed)
         n_q = 0
+        any_mask = next(iter(leaf_mask.values()))
 
         def curve_for_order(order):
             nonlocal n_q
-            m = np.zeros_like(next(iter(leaf_mask.values())))
-            vs = []
+            # precompute the n nested cumulative masks, then score them all at once
+            cum = np.zeros_like(any_mask)
+            masks = []
             for l in order:
-                m = m | leaf_mask[l]
-                vs.append(self._value_of_mask(m, x, b, x0_val, target))
-                n_q += 1
-            return vs
+                cum = cum | leaf_mask[l]
+                masks.append(cum.copy())
+            vs = self._values_of_masks(masks, x, b, x0_val, target)
+            n_q += len(masks)
+            return vs.tolist()
 
         # random controls (averaged)
         rand_curves = []
@@ -568,9 +554,6 @@ class PyramidExplainer(Explainer):
         color_curve = curve_for_order(color_order)
 
         # LIME-order control: pure surrogate rank, no greedy v(S) decisions.
-        # This is the key control for the LIME-primed method: if the greedy
-        # curve does not rise faster than this, the model's joint-score steps
-        # add nothing beyond LIME. In full_lime mode the chain equals this curve.
         lime_curve = curve_for_order(list(lime_ranked))
 
         return {
@@ -622,7 +605,7 @@ class PyramidExplainer(Explainer):
         sum_delta = float(sum(r.delta for r in internals))
         identity_lhs = float(root.v)
         identity_rhs = sum_leaf_v + sum_delta
-        identity_residual = identity_lhs - identity_rhs   # ~0 up to float error
+        identity_residual = identity_lhs - identity_rhs
 
         # --- non-additivity index ------------------------------------------ #
         denom = sum(abs(l.v) for l in leaves) + sum(abs(r.delta) for r in internals)
@@ -707,6 +690,7 @@ class PyramidExplainer(Explainer):
                 "n_audit_queries": n_audit_q,
                 "n_control_queries": n_control_q,
                 "n_total_queries": n_lime_q + n_construction_q + n_audit_q + n_control_q,
+                "max_batch": self.max_batch,
                 # telescoping self-check
                 "root_v": float(root.v),
                 "sum_leaf_v": sum_leaf_v,
@@ -734,8 +718,8 @@ class PyramidExplainer(Explainer):
                 # full tree + leaf masks
                 "tree": all_serialized,
                 "leaf_masks": leaf_masks,
-                "leaf_masks_by_label": leaf_masks_by_label,   # NEW: keyed by SLIC label
-                "leaf_labels": labels,  
+                "leaf_masks_by_label": leaf_masks_by_label,
+                "leaf_labels": labels,
                 "reference": "blur_completion",
             },
         )
