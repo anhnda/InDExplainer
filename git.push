@@ -1,5 +1,5 @@
 git add .
 git commit -m "Update"
-git push origin lid
+git push origin hime
 
 
