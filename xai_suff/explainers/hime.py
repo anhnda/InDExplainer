@@ -35,8 +35,8 @@ class HIMEExplainer(Explainer):
     def __init__(self, *args, grid=(12, 12), n_samples=2500, sigma=11.0,
                  kernel_width=0.25, seed=0, batch_size=64,
                  screen_quantile=0.6, max_active_cells=40,
-                 stability_runs=20, stability_thresh=0.8,
-                 lasso_lambda_scale=1.0, **kw):
+                 stability_runs=20, stability_thresh=0.6,
+                 lasso_lambda_scale=0.3, **kw):
         """
         screen_quantile   : keep cells whose |main effect| is above this quantile.
         max_active_cells  : hard cap m' on screened cells (controls p = m'+C(m',2)).
@@ -126,15 +126,40 @@ class HIMEExplainer(Explainer):
         sigma_hat = max(np.std(y), 1e-6)
         lam = self.lasso_lambda_scale * sigma_hat * np.sqrt(2 * np.log(p_dim) / self.n_samples)
 
-        rng = np.random.default_rng(self.seed)
-        sel_count = np.zeros(p_dim)
-        for _ in range(self.stability_runs):
-            idx = rng.choice(self.n_samples, self.n_samples, replace=True)
-            m = LassoLars(alpha=lam, fit_intercept=True, max_iter=4000)
-            m.fit(X[idx], y[idx])
-            sel_count += (np.abs(m.coef_) > 0).astype(float)
-        stab = sel_count / self.stability_runs
+        def _stability(lmbda):
+            rng = np.random.default_rng(self.seed)
+            sc = np.zeros(p_dim)
+            for _ in range(self.stability_runs):
+                idx = rng.choice(self.n_samples, self.n_samples, replace=True)
+                mm = LassoLars(alpha=lmbda, fit_intercept=True, max_iter=4000)
+                mm.fit(X[idx], y[idx])
+                sc += (np.abs(mm.coef_) > 0).astype(float)
+            return sc / self.stability_runs
+
+        stab = _stability(lam)
         selected = stab >= self.stability_thresh
+        n_pairs = int(np.sum(selected[m_act:]))
+
+        # auto-relax: if signal is weak and nothing survived, step lambda down
+        # rather than silently returning an empty (blank) explanation.
+        tries = 0
+        while n_pairs == 0 and tries < 3:
+            lam *= 0.3
+            stab = _stability(lam)
+            selected = stab >= self.stability_thresh
+            n_pairs = int(np.sum(selected[m_act:]))
+            tries += 1
+
+        # full single-fit selection count, for the diagnostic
+        full = LassoLars(alpha=lam, fit_intercept=True, max_iter=4000).fit(X, y)
+        n_full = int(np.sum(np.abs(full.coef_[m_act:]) > 0))
+        print(f"[hime] sigma(y)={sigma_hat:.4f} lam={lam:.5f} "
+              f"single-fit pairs={n_full} stable pairs={n_pairs}"
+              f"{' (relaxed x%d)' % tries if tries else ''}")
+        if n_pairs == 0:
+            print("[hime] WARNING: no interaction pairs survived. Signal may be "
+                  "below the detection floor -- try lower lasso_lambda_scale, "
+                  "lower stability_thresh, larger n_samples, or smaller sigma.")
 
         # ---------- STAGE 3: re-solve on selected support ----------
         sel_idx = np.where(selected)[0]
